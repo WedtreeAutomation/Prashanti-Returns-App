@@ -566,6 +566,67 @@ class ShopifyService:
             logger.error(f"Failed to add store credit: {str(e)}")
             raise
     
+
+    def update_firebase_with_refund(self, refund_result: RefundResult, metadata: Optional[Dict] = None) -> bool:
+        if not db:
+            return False
+        
+        try:
+            order_id = metadata.get('orderId') if metadata else None
+            if not order_id:
+                return False
+            
+            # Extract agent name from metadata
+            agent_name = metadata.get('agentName', 'System') if metadata else 'System'
+            
+            return_ref = db.collection('returns').document(order_id)
+            return_doc = return_ref.get()
+            
+            if not return_doc.exists:
+                return False
+            
+            refund_details = {
+                'method': refund_result.refund_method.value,
+                'finalAmount': float(refund_result.amount) if refund_result.amount else 0,
+                'shopifyRefundId': refund_result.refund_id or refund_result.transaction_id,
+                'transactionId': refund_result.transaction_id,
+                'giftCardCode': refund_result.gift_card_code,
+                'transactions': refund_result.transactions,
+                'shopifyResponse': refund_result.raw_response,
+            }
+            
+            update_data = {
+                'refundStatus': 'Refunded',
+                'status': 'completed',
+                'updatedAt': firestore.SERVER_TIMESTAMP,
+                'refundDetails': refund_details,
+                'refundMethod': refund_result.refund_method.value,
+                'refundAmount': float(refund_result.amount) if refund_result.amount else 0,
+                'refundCompletedAt': firestore.SERVER_TIMESTAMP,
+                'shopifyRefundId': refund_result.refund_id,
+            }
+            
+            if refund_result.gift_card_code:
+                update_data['giftCardCode'] = refund_result.gift_card_code
+            
+            return_ref.update(update_data)
+            
+            # Updated to use agent_name instead of hardcoded 'System'[cite: 10]
+            activities_ref = db.collection('returns').document(order_id).collection('activities')
+            activities_ref.add({
+                'type': 'success',
+                'title': 'Refund Issued',
+                'description': f"Refund of ₹{float(refund_result.amount):.2f} issued via {refund_result.refund_method.value.replace('_', ' ')}",
+                'timestamp': firestore.SERVER_TIMESTAMP,
+                'user': agent_name,
+                'metadata': refund_details
+            })
+            
+            return True
+        except Exception as e:
+            logger.error(f"Firebase update failed: {str(e)}")
+            return False
+        
     def process_refund(self, order_gid: str, amount: Union[str, float], refund_method: RefundMethod, 
                        line_item_refunds: List[Dict], note: str, notify_customer: bool, metadata: Dict) -> RefundResult:
         """Centralized processor for non-original payment refunds (Store Credit & Gift Card)"""
@@ -634,62 +695,7 @@ class ShopifyService:
                 error_message=str(e)
             )
         
-    def update_firebase_with_refund(self, refund_result: RefundResult, metadata: Optional[Dict] = None) -> bool:
-        if not db:
-            return False
-        
-        try:
-            order_id = metadata.get('orderId') if metadata else None
-            if not order_id:
-                return False
-            
-            return_ref = db.collection('returns').document(order_id)
-            return_doc = return_ref.get()
-            
-            if not return_doc.exists:
-                return False
-            
-            refund_details = {
-                'method': refund_result.refund_method.value,
-                'finalAmount': float(refund_result.amount) if refund_result.amount else 0,
-                'shopifyRefundId': refund_result.refund_id or refund_result.transaction_id,
-                'transactionId': refund_result.transaction_id,
-                'giftCardCode': refund_result.gift_card_code,
-                'transactions': refund_result.transactions,
-                'shopifyResponse': refund_result.raw_response,
-            }
-            
-            update_data = {
-                'refundStatus': 'Refunded',
-                'status': 'completed',
-                'updatedAt': firestore.SERVER_TIMESTAMP,
-                'refundDetails': refund_details,
-                'refundMethod': refund_result.refund_method.value,
-                'refundAmount': float(refund_result.amount) if refund_result.amount else 0,
-                'refundCompletedAt': firestore.SERVER_TIMESTAMP,
-                'shopifyRefundId': refund_result.refund_id,
-            }
-            
-            if refund_result.gift_card_code:
-                update_data['giftCardCode'] = refund_result.gift_card_code
-            
-            return_ref.update(update_data)
-            
-            # Add activity log
-            activities_ref = db.collection('returns').document(order_id).collection('activities')
-            activities_ref.add({
-                'type': 'success',
-                'title': 'Refund Issued',
-                'description': f"Refund of ₹{float(refund_result.amount):.2f} issued via {refund_result.refund_method.value.replace('_', ' ')}",
-                'timestamp': firestore.SERVER_TIMESTAMP,
-                'user': 'System',
-                'metadata': refund_details
-            })
-            
-            return True
-        except Exception as e:
-            logger.error(f"Firebase update failed: {str(e)}")
-            return False
+    
 
 
 def get_shopify_service():
@@ -748,7 +754,7 @@ def get_bluedart_auth_headers():
 
 
 def update_firebase_with_waybill(ran, awb_number, token_number, pickup_date, label_url, result, metadata=None):
-    """Update Firebase with waybill details"""
+    """Update Firebase with waybill details with agent attribution"""
     if not db:
         return False
     
@@ -759,6 +765,9 @@ def update_firebase_with_waybill(ran, awb_number, token_number, pickup_date, lab
             return False
 
         doc_ref = docs[0].reference
+        
+        # Get the agent name from metadata, falling back to 'System'
+        agent_name = metadata.get('agentName') if metadata else 'System'
         
         clean_result = {k: v for k, v in result.items() if k != "AWBPrintContent"}
         
@@ -785,12 +794,13 @@ def update_firebase_with_waybill(ran, awb_number, token_number, pickup_date, lab
         
         doc_ref.update(update_data)
 
+        # Updated to use agent_name instead of hardcoded 'System'
         db.collection("returns").document(doc_ref.id).collection("activities").add({
             "type": "success",
             "title": "Pickup Created",
             "description": f"Return pickup scheduled. AWB: {awb_number}",
             "timestamp": firestore.SERVER_TIMESTAMP,
-            "user": "System",
+            "user": agent_name, 
             "metadata": {"awb": awb_number, "tokenNumber": token_number}
         })
 
@@ -798,11 +808,48 @@ def update_firebase_with_waybill(ran, awb_number, token_number, pickup_date, lab
     except Exception as e:
         logger.error(f"Firestore update failed: {str(e)}")
         return False
-
-
+    
 # ==========================================================
 # ORIGINAL SHOPIFY PROXY ENDPOINTS
 # ==========================================================
+def get_delivery_date_by_name(order_name):
+    """Fetch the delivery date of an order using Shopify GraphQL."""
+    graphql_url = f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+    
+    graphql_query = """
+    query GetOrderByName($searchQuery: String!) {
+      orders(first: 1, query: $searchQuery) {
+        nodes {
+          fulfillments(first: 50) {
+            deliveredAt
+          }
+        }
+      }
+    }
+    """
+    variables = {"searchQuery": f"name:'{order_name}'"}
+    
+    try:
+        response = requests.post(
+            graphql_url, 
+            headers=shopify_headers(), 
+            json={"query": graphql_query, "variables": variables},
+            timeout=10
+        )
+        if response.status_code == 200:
+            data = response.json()
+            orders = data.get("data", {}).get("orders", {}).get("nodes", [])
+            
+            # Find the first fulfillment that has a deliveredAt date
+            if orders and orders[0].get("fulfillments"):
+                for fulfillment in orders[0]["fulfillments"]:
+                    if fulfillment.get("deliveredAt"):
+                        return fulfillment["deliveredAt"] # Return raw ISO string
+    except Exception as e:
+        logger.error(f"Failed to fetch delivery date for {order_name}: {e}")
+        
+    return None
+
 @app.route('/api/orders/verify', methods=['POST'])
 @require_api_key
 def verify_order():
@@ -837,6 +884,12 @@ def verify_order():
         if not matched_order or matched_order.get('fulfillment_status') != 'fulfilled':
             return jsonify({'error': 'Order not found or not fulfilled'}), 404
         
+        # --- NEW CODE: Fetch and attach delivery date ---
+        delivered_at = get_delivery_date_by_name(matched_order.get('name'))
+        if delivered_at:
+            matched_order['delivered_at'] = delivered_at
+        # ------------------------------------------------
+        
         if verify_order_ownership(matched_order, verification_input):
             return jsonify({'order': matched_order})
         else:
@@ -845,7 +898,6 @@ def verify_order():
     except Exception as e:
         logger.error(f"Error verifying order: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
-
 
 @app.route('/api/orders/customer', methods=['POST'])
 @require_api_key
@@ -980,10 +1032,13 @@ def get_product_details(product_id):
 @app.route('/api/orders/<int:order_id>/restock', methods=['POST'])
 @require_api_key
 def restock_items(order_id):
-    """Create a Return in Shopify UI and Restock the items"""
+    """Create a Return in Shopify UI and Restock the items with agent attribution"""
     try:
         data = request.get_json()
         items = data.get('items', [])
+        # Extract the agent name and RAN for logging purposes
+        agent_name = data.get('agentName', 'System') 
+        ran = data.get('RAN')
         
         if not items:
             return jsonify({'message': 'No items to restock'}), 200
@@ -992,11 +1047,7 @@ def restock_items(order_id):
         headers = shopify_headers()
         order_gid = f"gid://shopify/Order/{order_id}"
 
-        # ---------------------------------------------------------
         # STEP 1: Get FulfillmentLineItem IDs
-        # To create a return, Shopify requires the ID of the specific 
-        # fulfillment that shipped the item, not just the line item ID.
-        # ---------------------------------------------------------
         query_fulfillments = """
         query getFulfillments($id: ID!) {
           order(id: $id) {
@@ -1029,7 +1080,6 @@ def restock_items(order_id):
             target_gid = f"gid://shopify/LineItem/{item['lineItemId']}"
             qty = item['quantityReturned']
             
-            # Match the standard line item to the fulfillment line item
             for f in fulfillments:
                 for edge in f.get('fulfillmentLineItems', {}).get('edges', []):
                     node = edge['node']
@@ -1037,27 +1087,21 @@ def restock_items(order_id):
                         return_line_items.append({
                             "fulfillmentLineItemId": node['id'],
                             "quantity": qty,
-                            "returnReason": "UNKNOWN" # Standard fallback reason
+                            "returnReason": "UNKNOWN"
                         })
                         break
 
-        # ---------------------------------------------------------
-        # STEP 2: Create the Return (Shows in Shopify UI)
-        # ---------------------------------------------------------
+        # STEP 2: Create the Return
         if return_line_items:
             mutation_return = """
             mutation returnCreate($returnInput: ReturnInput!) {
               returnCreate(returnInput: $returnInput) {
-                return {
-                  id
-                }
-                userErrors {
-                  message
-                }
+                return { id }
+                userErrors { message }
               }
             }
             """
-            return_res = requests.post(
+            requests.post(
                 graphql_url, headers=headers, 
                 json={
                     "query": mutation_return, 
@@ -1068,19 +1112,9 @@ def restock_items(order_id):
                         }
                     }
                 }
-            ).json()
-            
-            # If a return is already open for this item, Shopify throws an error.
-            # We log it, but proceed to restock anyway so the process doesn't halt.
-            user_errors = return_res.get('data', {}).get('returnCreate', {}).get('userErrors', [])
-            if user_errors:
-                logger.warning(f"Return creation warning (may already exist): {user_errors}")
+            )
 
-        # ---------------------------------------------------------
-        # STEP 3: Restock the Inventory via REST API
-        # By processing a refund with `restock_type: return`, Shopify 
-        # increments inventory and automatically ties it to the Return above.
-        # ---------------------------------------------------------
+        # STEP 3: Restock the Inventory
         order_response = requests.get(
             f"{SHOPIFY_BASE_URL}/orders/{order_id}.json",
             headers=headers,
@@ -1088,14 +1122,14 @@ def restock_items(order_id):
         )
         
         if order_response.status_code != 200:
-            return jsonify({'error': 'Failed to fetch order details for restocking'}), 500
+            return jsonify({'error': 'Failed to fetch order details'}), 500
             
-        order = order_response.json().get('order', {})
-        fulfillments_rest = order.get('fulfillments', [])
+        order_json = order_response.json().get('order', {})
+        fulfillments_rest = order_json.get('fulfillments', [])
         location_id = fulfillments_rest[0].get('location_id') if fulfillments_rest else None
         
         if not location_id:
-            return jsonify({'error': 'Could not determine Location ID for restocking'}), 400
+            return jsonify({'error': 'Could not determine Location ID'}), 400
 
         refund_line_items = [
             {
@@ -1109,10 +1143,10 @@ def restock_items(order_id):
         
         payload = {
             'refund': {
-                'currency': order.get('currency'),
-                'notify': False,  # Prevents confusing emails
+                'currency': order_json.get('currency'),
+                'notify': False,
                 'refund_line_items': refund_line_items,
-                'transactions': [] # Leaves financials untouched; just inventory
+                'transactions': []
             }
         }
         
@@ -1124,14 +1158,27 @@ def restock_items(order_id):
         )
         
         if response.status_code in [200, 201]:
+            # Log the successful restock event to Firestore[cite: 10]
+            if db and ran:
+                docs = list(db.collection("returns").where("RAN", "==", ran).limit(1).stream())
+                if docs:
+                    doc_ref = docs[0].reference
+                    db.collection("returns").document(doc_ref.id).collection("activities").add({
+                        "type": "success",
+                        "title": "Items Restocked",
+                        "description": f"{len(items)} item(s) restocked in inventory",
+                        "timestamp": firestore.SERVER_TIMESTAMP,
+                        "user": agent_name,  # Attributed to logged-in agent[cite: 10]
+                        "metadata": {"items": items}
+                    })
             return jsonify({'success': True})
         else:
-            return jsonify({'error': 'Failed to restock items', 'details': response.json()}), response.status_code
+            return jsonify({'error': 'Failed to restock items'}), response.status_code
             
     except Exception as e:
-        logger.error(f"Error returning/restocking items: {str(e)}")
+        logger.error(f"Error restock_items: {str(e)}")
         return jsonify({'error': str(e)}), 500
-
+    
 # ==========================================================
 # WEBHOOK PROXY ENDPOINTS (Forward to n8n)
 # ==========================================================
@@ -1552,7 +1599,7 @@ def refund_original_payment():
 @app.route('/api/refund/manual', methods=['POST'])
 @require_api_key
 def refund_manual():
-    """Mark refund as manually processed"""
+    """Mark refund as manually processed with agent attribution"""
     try:
         data = request.get_json()
         if not data:
@@ -1563,6 +1610,8 @@ def refund_manual():
             if field not in data:
                 return jsonify({'error': f'Missing required field: {field}'}), 400
         
+        # Extract agent name from the top level of the request[cite: 10]
+        agent_name = data.get('agentName', 'System')
         manual_refund_id = f"manual_{data['orderId']}_{int(datetime.now().timestamp())}"
         
         firebase_updated = False
@@ -1588,13 +1637,14 @@ def refund_manual():
                     
                     return_ref.update(update_data)
                     
+                    # Log activity with the actual agent name[cite: 10]
                     activities_ref = db.collection('returns').document(data['orderId']).collection('activities')
                     activities_ref.add({
                         'type': 'success',
                         'title': 'Refund Issued',
                         'description': f"Refund of ₹{float(data['amount']):.2f} marked as manually processed",
                         'timestamp': firestore.SERVER_TIMESTAMP,
-                        'user': 'System',
+                        'user': agent_name,  # Attributed to logged-in agent[cite: 10]
                         'metadata': {
                             'refundMethod': 'manual',
                             'amount': float(data['amount']),
@@ -1612,11 +1662,245 @@ def refund_manual():
             'refundId': manual_refund_id,
             'amount': data['amount'],
             'orderName': data.get('orderId'),
-            'note': data.get('note', 'Manual refund processed'),
             'firebaseUpdated': firebase_updated
         }), 200
     except Exception as e:
         logger.error(f"Error in manual refund: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/products/<int:product_id>/variants', methods=['GET'])
+@require_api_key
+def get_product_variants(product_id):
+    """
+    Fetch full product data including all variants, options, and images.
+    Used by the Exchange Modal to show available replacement variants.
+    
+    Returns:
+        product.variants     — all variants with price, SKU, inventory, options
+        product.options      — option groups e.g. [{ name: "Color", values: ["Red","Blue"] }]
+        product.images       — images with variant_ids for variant-specific images
+    """
+    try:
+        response = requests.get(
+            f"{SHOPIFY_BASE_URL}/products/{product_id}.json",
+            headers=shopify_headers(),
+            params={
+                'fields': 'id,title,handle,product_type,tags,status,variants,options,images'
+            },
+            timeout=10
+        )
+ 
+        if response.status_code == 404:
+            return jsonify({'error': 'Product not found'}), 404
+ 
+        if response.status_code != 200:
+            logger.error(f"Shopify returned {response.status_code} for product {product_id}")
+            return jsonify({'error': 'Failed to fetch product from Shopify'}), 500
+ 
+        product = response.json().get('product', {})
+        if not product:
+            return jsonify({'error': 'Product not found'}), 404
+ 
+        # Process variants — add an `available` flag based on inventory
+        variants = []
+        for v in product.get('variants', []):
+            inventory_qty = v.get('inventory_quantity', 0)
+            inventory_policy = v.get('inventory_policy', 'deny')
+ 
+            # `continue` policy means sell even when out of stock
+            available = inventory_qty > 0 or inventory_policy == 'continue'
+ 
+            variants.append({
+                'id':                  v.get('id'),
+                'title':               v.get('title'),
+                'sku':                 v.get('sku') or '',
+                'price':               v.get('price'),
+                'compare_at_price':    v.get('compare_at_price'),
+                'inventory_quantity':  inventory_qty,
+                'inventory_policy':    inventory_policy,
+                'available':           available,
+                'option1':             v.get('option1'),
+                'option2':             v.get('option2'),
+                'option3':             v.get('option3'),
+                'image_id':            v.get('image_id'),
+                'weight':              v.get('weight'),
+                'weight_unit':         v.get('weight_unit'),
+            })
+ 
+        # Process images
+        images = []
+        for img in product.get('images', []):
+            images.append({
+                'id':          img.get('id'),
+                'src':         img.get('src'),
+                'alt':         img.get('alt'),
+                'variant_ids': img.get('variant_ids', []),
+                'position':    img.get('position', 0),
+            })
+ 
+        # Sort images: variant-specific first, then general
+        images.sort(key=lambda x: (len(x['variant_ids']) == 0, x['position']))
+ 
+        return jsonify({
+            'product': {
+                'id':           product.get('id'),
+                'title':        product.get('title'),
+                'handle':       product.get('handle'),
+                'product_type': product.get('product_type'),
+                'tags':         product.get('tags'),
+                'status':       product.get('status'),
+                'variants':     variants,
+                'options':      product.get('options', []),
+                'images':       images,
+            }
+        })
+ 
+    except requests.Timeout:
+        logger.error(f"Timeout fetching product variants for {product_id}")
+        return jsonify({'error': 'Request timed out'}), 504
+ 
+    except Exception as e:
+        logger.error(f"Error fetching product variants for {product_id}: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+ 
+
+@app.route('/api/products/by-sku/<path:sku>/variants', methods=['GET', 'OPTIONS'])
+@require_api_key
+def get_product_variants_by_sku(sku):
+    """
+    Look up a product by exact variant SKU using GraphQL, then return full
+    variant/option/image data. Used as fallback when productId is not stored.
+ 
+    Uses GraphQL productVariants query which does exact SKU matching —
+    unlike the REST /variants.json endpoint which does prefix matching.
+    """
+    try:
+        clean_sku = sku.strip()
+        logger.info(f"Looking up product by SKU (GraphQL): {clean_sku}")
+ 
+        graphql_url = f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+ 
+        # Step 1: Use GraphQL to find exact SKU match and get product_id
+        query = """
+        query FindVariantBySKU($sku: String!) {
+          productVariants(first: 5, query: $sku) {
+            edges {
+              node {
+                id
+                sku
+                product {
+                  id
+                  legacyResourceId
+                }
+              }
+            }
+          }
+        }
+        """
+ 
+        gql_response = requests.post(
+            graphql_url,
+            headers=shopify_headers(),
+            json={"query": query, "variables": {"sku": f"sku:{clean_sku}"}},
+            timeout=10
+        )
+ 
+        if gql_response.status_code != 200:
+            logger.error(f"GraphQL error: {gql_response.status_code}")
+            return jsonify({'error': 'Failed to search Shopify for SKU'}), 500
+ 
+        gql_data = gql_response.json()
+        edges = gql_data.get('data', {}).get('productVariants', {}).get('edges', [])
+ 
+        if not edges:
+            return jsonify({'error': f'No product found with SKU: {clean_sku}'}), 404
+ 
+        # Exact match from results
+        exact = next(
+            (e['node'] for e in edges if e['node'].get('sku', '').strip() == clean_sku),
+            None
+        )
+        if not exact:
+            logger.warning(f"GraphQL returned variants but none match SKU exactly: {clean_sku}")
+            logger.warning(f"Got: {[e['node'].get('sku') for e in edges]}")
+            # Fall back to first result
+            exact = edges[0]['node']
+ 
+        product_id = exact['product']['legacyResourceId']
+        logger.info(f"SKU {clean_sku} → product_id {product_id}")
+ 
+        # Step 2: Fetch full product via REST (same as productId endpoint)
+        product_response = requests.get(
+            f"{SHOPIFY_BASE_URL}/products/{product_id}.json",
+            headers=shopify_headers(),
+            params={
+                'fields': 'id,title,handle,product_type,tags,status,variants,options,images'
+            },
+            timeout=10
+        )
+ 
+        if product_response.status_code != 200:
+            return jsonify({'error': 'Failed to fetch product details'}), 500
+ 
+        product = product_response.json().get('product', {})
+        if not product:
+            return jsonify({'error': 'Product not found'}), 404
+ 
+        # Process variants
+        processed_variants = []
+        for v in product.get('variants', []):
+            inventory_qty    = v.get('inventory_quantity', 0)
+            inventory_policy = v.get('inventory_policy', 'deny')
+            available        = inventory_qty > 0 or inventory_policy == 'continue'
+            processed_variants.append({
+                'id':                 v.get('id'),
+                'title':              v.get('title'),
+                'sku':                v.get('sku') or '',
+                'price':              v.get('price'),
+                'compare_at_price':   v.get('compare_at_price'),
+                'inventory_quantity': inventory_qty,
+                'inventory_policy':   inventory_policy,
+                'available':          available,
+                'option1':            v.get('option1'),
+                'option2':            v.get('option2'),
+                'option3':            v.get('option3'),
+                'image_id':           v.get('image_id'),
+                'weight':             v.get('weight'),
+                'weight_unit':        v.get('weight_unit'),
+            })
+ 
+        # Process images — sort variant-specific first
+        images = []
+        for img in product.get('images', []):
+            images.append({
+                'id':          img.get('id'),
+                'src':         img.get('src'),
+                'alt':         img.get('alt'),
+                'variant_ids': img.get('variant_ids', []),
+                'position':    img.get('position', 0),
+            })
+        images.sort(key=lambda x: (len(x['variant_ids']) == 0, x['position']))
+ 
+        return jsonify({
+            'product': {
+                'id':           product.get('id'),
+                'title':        product.get('title'),
+                'handle':       product.get('handle'),
+                'product_type': product.get('product_type'),
+                'tags':         product.get('tags'),
+                'status':       product.get('status'),
+                'variants':     processed_variants,
+                'options':      product.get('options', []),
+                'images':       images,
+            }
+        })
+ 
+    except requests.Timeout:
+        logger.error(f"Timeout looking up SKU {sku}")
+        return jsonify({'error': 'Request timed out'}), 504
+ 
+    except Exception as e:
+        logger.error(f"Error looking up SKU {sku}: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 # ==========================================================
