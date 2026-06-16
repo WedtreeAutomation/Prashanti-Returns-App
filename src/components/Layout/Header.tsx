@@ -99,15 +99,6 @@ export const Header: React.FC<HeaderProps> = ({ onMenuClick, title = "Dashboard"
                       {formatRole(user.role)}
                     </span>
                   </div>
-                  
-                  {/* Quick Stats for Agents/Managers */}
-                  <div className="px-4 py-2 border-b border-slate-100">
-                    <p className="text-xs text-slate-500 mb-1">Today's Stats</p>
-                    <div className="flex justify-between text-xs">
-                      <span className="text-slate-600">Returns processed:</span>
-                      <span className="font-medium text-slate-800">3</span>
-                    </div>
-                  </div>
 
                   <button
                     onClick={onLogout}
