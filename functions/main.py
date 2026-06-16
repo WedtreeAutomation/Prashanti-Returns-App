@@ -12,7 +12,7 @@ from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 from dotenv import load_dotenv
 from firebase_functions import https_fn
-# Firebase Imports
+import threading
 import firebase_admin
 from firebase_admin import credentials, firestore, storage as fb_storage
 
@@ -64,7 +64,6 @@ try:
         
         db = firestore.client()
         bucket = fb_storage.bucket()
-        logger.info(f"✅ Firebase Admin Initialized. Target Bucket: {storage_bucket_name}")
     else:
         logger.warning("⚠️ Firebase credentials missing in .env")
 except Exception as e:
@@ -160,23 +159,27 @@ def shopify_headers():
     }
 
 def trigger_webhook(url, payload, log_context):
-    """Send webhook notification"""
-    try:
-        logger.info(f"Sending {log_context} webhook: {payload}")
-        response = requests.post(url, json=payload, headers={
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-        }, timeout=10)
-        
-        if response.ok:
-            logger.info(f"{log_context} webhook successful")
-            return True
-        else:
-            logger.warning(f"{log_context} webhook returned status: {response.status_code}")
-            return False
-    except Exception as e:
-        logger.error(f"Failed to send {log_context} notification: {str(e)}")
-        return False
+    """Send webhook notification asynchronously (fire-and-forget)"""
+    def run_webhook():
+        try:
+            response = requests.post(url, json=payload, headers={
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            }, timeout=30)
+            
+            if response.ok:
+                logger.info(f"✅ {log_context} webhook successful")
+            else:
+                logger.warning(f"⚠️ {log_context} webhook returned status: {response.status_code}")
+        except Exception as e:
+            logger.error(f"❌ Failed to send {log_context} notification: {str(e)}")
+
+    # Start the request in a background thread so the UI doesn't wait
+    thread = threading.Thread(target=run_webhook)
+    thread.start()
+    
+    # Immediately return True to the frontend
+    return True
 
 # ==========================================================
 # REFUND CLASSES (From Your Provided Code)
@@ -850,6 +853,70 @@ def get_delivery_date_by_name(order_name):
         
     return None
 
+def get_extended_order_info(order_name):
+    """Fetch the delivery date and product details (images, tags) in one query."""
+    graphql_url = f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+    
+    graphql_query = """
+    query GetOrderByName($searchQuery: String!) {
+      orders(first: 1, query: $searchQuery) {
+        nodes {
+          fulfillments(first: 50) {
+            deliveredAt
+          }
+          lineItems(first: 50) {
+            nodes {
+              product {
+                legacyResourceId
+                tags
+                featuredImage {
+                  url
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    variables = {"searchQuery": f"name:'{order_name}'"}
+    extended_info = {"delivered_at": None, "product_details": {}}
+    
+    try:
+        response = requests.post(
+            graphql_url, 
+            headers=shopify_headers(), 
+            json={"query": graphql_query, "variables": variables},
+            timeout=10
+        )
+        if response.status_code == 200:
+            data = response.json()
+            orders = data.get("data", {}).get("orders", {}).get("nodes", [])
+            
+            if orders:
+                order = orders[0]
+                
+                # 1. Get delivery date
+                for fulfillment in order.get("fulfillments", []):
+                    if fulfillment.get("deliveredAt"):
+                        extended_info["delivered_at"] = fulfillment["deliveredAt"]
+                        break
+                
+                # 2. Extract product images and tags
+                for item in order.get("lineItems", {}).get("nodes", []):
+                    product = item.get("product")
+                    if product:
+                        legacy_id = product.get("legacyResourceId")
+                        if legacy_id:
+                            extended_info["product_details"][str(legacy_id)] = {
+                                "image": product.get("featuredImage", {}).get("url") if product.get("featuredImage") else None,
+                                "tags": product.get("tags", [])
+                            }
+    except Exception as e:
+        logger.error(f"Failed to fetch extended info for {order_name}: {e}")
+        
+    return extended_info
+
 @app.route('/api/orders/verify', methods=['POST'])
 @require_api_key
 def verify_order():
@@ -884,10 +951,12 @@ def verify_order():
         if not matched_order or matched_order.get('fulfillment_status') != 'fulfilled':
             return jsonify({'error': 'Order not found or not fulfilled'}), 404
         
-        # --- NEW CODE: Fetch and attach delivery date ---
-        delivered_at = get_delivery_date_by_name(matched_order.get('name'))
-        if delivered_at:
-            matched_order['delivered_at'] = delivered_at
+        # --- NEW CODE: Attach extended details from GraphQL ---
+        extended_info = get_extended_order_info(matched_order.get('name'))
+        if extended_info['delivered_at']:
+            matched_order['delivered_at'] = extended_info['delivered_at']
+        if extended_info['product_details']:
+            matched_order['product_details'] = extended_info['product_details']
         # ------------------------------------------------
         
         if verify_order_ownership(matched_order, verification_input):
@@ -1028,11 +1097,10 @@ def get_product_details(product_id):
         logger.error(f"Error fetching product details: {str(e)}")
         return jsonify({'image': None, 'tags': []}), 500
 
-
 @app.route('/api/orders/<int:order_id>/restock', methods=['POST'])
 @require_api_key
 def restock_items(order_id):
-    """Create a Return in Shopify UI and Restock the items with agent attribution"""
+    """Restock items back into Shopify Inventory reliably"""
     try:
         data = request.get_json()
         items = data.get('items', [])
@@ -1042,79 +1110,10 @@ def restock_items(order_id):
         
         if not items:
             return jsonify({'message': 'No items to restock'}), 200
-        
-        graphql_url = f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
-        headers = shopify_headers()
-        order_gid = f"gid://shopify/Order/{order_id}"
-
-        # STEP 1: Get FulfillmentLineItem IDs
-        query_fulfillments = """
-        query getFulfillments($id: ID!) {
-          order(id: $id) {
-            fulfillments(first: 10) {
-              id
-              fulfillmentLineItems(first: 50) {
-                edges {
-                  node {
-                    id
-                    quantity
-                    lineItem {
-                      id
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-        """
-        order_data = requests.post(
-            graphql_url, headers=headers, 
-            json={"query": query_fulfillments, "variables": {"id": order_gid}}
-        ).json()
-
-        fulfillments = order_data.get('data', {}).get('order', {}).get('fulfillments', [])
-        
-        return_line_items = []
-        for item in items:
-            target_gid = f"gid://shopify/LineItem/{item['lineItemId']}"
-            qty = item['quantityReturned']
             
-            for f in fulfillments:
-                for edge in f.get('fulfillmentLineItems', {}).get('edges', []):
-                    node = edge['node']
-                    if node['lineItem']['id'] == target_gid:
-                        return_line_items.append({
-                            "fulfillmentLineItemId": node['id'],
-                            "quantity": qty,
-                            "returnReason": "UNKNOWN"
-                        })
-                        break
+        headers = shopify_headers()
 
-        # STEP 2: Create the Return
-        if return_line_items:
-            mutation_return = """
-            mutation returnCreate($returnInput: ReturnInput!) {
-              returnCreate(returnInput: $returnInput) {
-                return { id }
-                userErrors { message }
-              }
-            }
-            """
-            requests.post(
-                graphql_url, headers=headers, 
-                json={
-                    "query": mutation_return, 
-                    "variables": {
-                        "returnInput": {
-                            "orderId": order_gid,
-                            "returnLineItems": return_line_items
-                        }
-                    }
-                }
-            )
-
-        # STEP 3: Restock the Inventory
+        # STEP 1: Fetch the order to get Currency and Location ID
         order_response = requests.get(
             f"{SHOPIFY_BASE_URL}/orders/{order_id}.json",
             headers=headers,
@@ -1122,15 +1121,33 @@ def restock_items(order_id):
         )
         
         if order_response.status_code != 200:
-            return jsonify({'error': 'Failed to fetch order details'}), 500
+            return jsonify({'error': 'Failed to fetch order details from Shopify'}), 500
             
         order_json = order_response.json().get('order', {})
         fulfillments_rest = order_json.get('fulfillments', [])
-        location_id = fulfillments_rest[0].get('location_id') if fulfillments_rest else None
         
+        location_id = None
+        
+        # Attempt 1: Get location from the order's fulfillment
+        if fulfillments_rest:
+            for f in fulfillments_rest:
+                if f.get('location_id'):
+                    location_id = f.get('location_id')
+                    break
+                    
+        # Attempt 2: Fallback to the store's primary location
         if not location_id:
-            return jsonify({'error': 'Could not determine Location ID'}), 400
+            loc_res = requests.get(f"{SHOPIFY_BASE_URL}/locations.json", headers=headers, timeout=10)
+            if loc_res.status_code == 200:
+                locations = loc_res.json().get('locations', [])
+                if locations:
+                    location_id = locations[0]['id']
+                    
+        if not location_id:
+            return jsonify({'error': 'Could not determine a valid Location ID for restocking'}), 400
 
+        # STEP 2: Build the Restock Payload
+        # We process a $0.00 refund specifically to trigger the inventory restock
         refund_line_items = [
             {
                 'line_item_id': item.get('lineItemId'),
@@ -1146,10 +1163,11 @@ def restock_items(order_id):
                 'currency': order_json.get('currency'),
                 'notify': False,
                 'refund_line_items': refund_line_items,
-                'transactions': []
+                'transactions': [] # Empty array ensures NO money is moved, ONLY inventory is adjusted
             }
         }
         
+        # STEP 3: Execute Restock
         response = requests.post(
             f"{SHOPIFY_BASE_URL}/orders/{order_id}/refunds.json",
             headers=headers,
@@ -1158,7 +1176,7 @@ def restock_items(order_id):
         )
         
         if response.status_code in [200, 201]:
-            # Log the successful restock event to Firestore[cite: 10]
+            # Log the successful restock event to Firestore
             if db and ran:
                 docs = list(db.collection("returns").where("RAN", "==", ran).limit(1).stream())
                 if docs:
@@ -1168,12 +1186,15 @@ def restock_items(order_id):
                         "title": "Items Restocked",
                         "description": f"{len(items)} item(s) restocked in inventory",
                         "timestamp": firestore.SERVER_TIMESTAMP,
-                        "user": agent_name,  # Attributed to logged-in agent[cite: 10]
-                        "metadata": {"items": items}
+                        "user": agent_name,
+                        "metadata": {"items": items, "location_id": location_id}
                     })
             return jsonify({'success': True})
         else:
-            return jsonify({'error': 'Failed to restock items'}), response.status_code
+            # Safely capture exact Shopify error for easier debugging
+            error_details = response.json()
+            logger.error(f"Shopify Restock Failed: {error_details}")
+            return jsonify({'error': f"Shopify rejected restock: {error_details}"}), response.status_code
             
     except Exception as e:
         logger.error(f"Error restock_items: {str(e)}")
@@ -1776,7 +1797,6 @@ def get_product_variants_by_sku(sku):
     """
     try:
         clean_sku = sku.strip()
-        logger.info(f"Looking up product by SKU (GraphQL): {clean_sku}")
  
         graphql_url = f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
  
@@ -1827,7 +1847,6 @@ def get_product_variants_by_sku(sku):
             exact = edges[0]['node']
  
         product_id = exact['product']['legacyResourceId']
-        logger.info(f"SKU {clean_sku} → product_id {product_id}")
  
         # Step 2: Fetch full product via REST (same as productId endpoint)
         product_response = requests.get(
@@ -1923,9 +1942,7 @@ def get_customer_balances():
             
         identifier = data.get('identifier')
         identifier_type = data.get('identifierType', 'email')
-        
-        logger.info(f"Fetching balances for {identifier_type}: {identifier}")
-        
+                
         if not identifier:
             return jsonify({'error': 'Missing identifier'}), 400
         
@@ -1952,14 +1969,11 @@ def get_customer_balances():
                 'store_credit_accounts': [],
                 'gift_cards': []
             }), 200
-        
-        logger.info(f"Customer found: {customer.get('id')} - {customer.get('email')}")
-        
+                
         # Step 2: Get store credit accounts (with error handling)
         store_credit_accounts = []
         try:
             store_credit_accounts = get_customer_store_credit_accounts(customer)
-            logger.info(f"Found {len(store_credit_accounts)} store credit accounts")
         except Exception as e:
             logger.error(f"Error fetching store credit: {str(e)}", exc_info=True)
             # Continue without store credit data
@@ -1968,7 +1982,6 @@ def get_customer_balances():
         gift_cards = []
         try:
             gift_cards = get_customer_gift_cards(customer)
-            logger.info(f"Found {len(gift_cards)} gift cards")
         except Exception as e:
             logger.error(f"Error fetching gift cards: {str(e)}", exc_info=True)
             # Continue without gift card data
@@ -1982,7 +1995,6 @@ def get_customer_balances():
             'gift_cards': gift_cards
         }
         
-        logger.info(f"Successfully fetched balances for customer")
         return jsonify(response_data), 200
         
     except Exception as e:
@@ -2019,7 +2031,6 @@ def find_customer_by_identifier(identifier: str, identifier_type: str) -> Option
             customer = result.get('customer')
             
             if customer:
-                logger.info(f"Found customer by email: {customer.get('id')}")
                 return customer
             return None
             
@@ -2028,9 +2039,7 @@ def find_customer_by_identifier(identifier: str, identifier_type: str) -> Option
             clean_phone = re.sub(r'\D', '', identifier)
             # Take last 10 digits for matching
             clean_phone = clean_phone[-10:] if len(clean_phone) >= 10 else clean_phone
-            
-            logger.info(f"Searching for customer with phone ending in: {clean_phone}")
-            
+                        
             # First try to find customer by phone using customers query
             query = """
             query GetCustomerByPhone($query: String!) {
@@ -2057,7 +2066,6 @@ def find_customer_by_identifier(identifier: str, identifier_type: str) -> Option
             
             if customers:
                 customer = customers[0].get('node')
-                logger.info(f"Found customer by phone: {customer.get('id')}")
                 return customer
             
             logger.warning(f"No customer found with phone: {clean_phone}")
@@ -2077,9 +2085,7 @@ def get_customer_store_credit_accounts(customer: Dict) -> List[Dict]:
         if not customer_id:
             logger.warning("Customer ID missing for store credit fetch")
             return []
-        
-        logger.info(f"Fetching store credit for customer: {customer_id}")
-        
+                
         query = """
         query GetStoreCreditAccounts($customerId: ID!) {
             customer(id: $customerId) {
@@ -2101,9 +2107,7 @@ def get_customer_store_credit_accounts(customer: Dict) -> List[Dict]:
         })
         
         accounts = result.get('customer', {}).get('storeCreditAccounts', {}).get('nodes', [])
-        
-        logger.info(f"Retrieved {len(accounts)} store credit accounts")
-        
+                
         return [{
             'id': acc['id'],
             'balance_amount': float(acc['balance']['amount']),
@@ -2124,10 +2128,7 @@ def get_customer_gift_cards(customer: Dict) -> List[Dict]:
         if not legacy_id:
             logger.warning("Legacy resource ID missing for gift card fetch")
             return []
-        
-        logger.info(f"Fetching gift cards for customer legacy ID: {legacy_id}")
-        
-        # CHANGED: 'code' is now 'maskedCode'
+                
         query = """
         query GetCustomerGiftCards($query: String!) {
             giftCards(first: 50, query: $query) {
@@ -2155,9 +2156,7 @@ def get_customer_gift_cards(customer: Dict) -> List[Dict]:
         })
         
         gift_cards = result.get('giftCards', {}).get('edges', [])
-        
-        logger.info(f"Retrieved {len(gift_cards)} gift cards")
-        
+                
         return [{
             'id': gc['node']['id'],
             'balance_amount': float(gc['node']['balance']['amount']),
@@ -2230,9 +2229,7 @@ def generate_waybill():
         
         if not ran:
             return jsonify({"success": False, "error": "Missing RAN (CreditReferenceNo)"}), 400
-        
-        logger.info(f"Generating pickup for RAN: {ran}")
-        
+                
         headers = get_bluedart_auth_headers()
         response = requests.post(
             BlueDartConfig.BLUEDART_WAYBILL_URL,
@@ -2263,9 +2260,7 @@ def generate_waybill():
         
         if not awb_number:
             return jsonify({"success": False, "error": "AWB not returned by provider"}), 500
-        
-        logger.info(f"AWB generated: {awb_number}")
-        
+                
         label_url = None
         
         if base64_pdf and bucket:
@@ -2288,7 +2283,6 @@ def generate_waybill():
                 safe_path = urllib.parse.quote(blob_path, safe="")
                 label_url = f"https://firebasestorage.googleapis.com/v0/b/{bucket.name}/o/{safe_path}?alt=media"
                 
-                logger.info(f"Label stored: {label_url}")
             except Exception as e:
                 logger.error(f"Label upload failed: {str(e)}")
         
@@ -2326,7 +2320,6 @@ def cancel_waybill():
         pickup_date = data.get('pickupDate')
         ran = data.get('ran')
         
-        logger.info(f"Cancelling AWB: {awb_number}")
         headers = get_bluedart_auth_headers()
         
         # Cancel AWB
@@ -2516,3 +2509,6 @@ def prashanti_returns_api(req: https_fn.Request) -> https_fn.Response:
     """Wraps the Flask app to be served as a Firebase Cloud Function."""
     with app.request_context(req.environ):
         return app.full_dispatch_request()
+
+# if __name__ == '__main__':
+#     app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
