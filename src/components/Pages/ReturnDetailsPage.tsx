@@ -86,7 +86,6 @@ const ShipmentStatusBadge = ({ status }: { status?: string }) => {
     'pickup created': { color: 'text-purple-700', bg: 'bg-purple-50 border-purple-100', icon: <Truck className="w-3 h-3" /> },
     'pickup scheduled': { color: 'text-blue-700', bg: 'bg-blue-50 border-blue-100', icon: <RefreshCw className="w-3 h-3" /> },
     'in transit': { color: 'text-indigo-700', bg: 'bg-indigo-50 border-indigo-100', icon: <Truck className="w-3 h-3" /> },
-    'delivered': { color: 'text-emerald-700', bg: 'bg-emerald-50 border-emerald-100', icon: <CheckCircle2 className="w-3 h-3" /> },
     'received': { color: 'text-green-700', bg: 'bg-green-50 border-green-100', icon: <CheckCircle2 className="w-3 h-3" /> },
     'pickup cancelled': { color: 'text-red-700', bg: 'bg-red-50 border-red-100', icon: <X className="w-3 h-3" /> },
     'failed': { color: 'text-red-700', bg: 'bg-red-50 border-red-100', icon: <AlertCircle className="w-3 h-3" /> },
@@ -102,7 +101,6 @@ const ShipmentStatusBadge = ({ status }: { status?: string }) => {
     </span>
   );
 };
-
 // Refund Status Badge - Money flow tracking
 const RefundStatusBadge = ({ status, method }: { status?: string; method?: string }) => {
   if (!status) return <span className="text-xs text-slate-400">Not Initiated</span>;
@@ -457,21 +455,6 @@ export const ReturnDetailsPage = () => {
   const [customerBalances, setCustomerBalances] = useState<CustomerBalances | null>(null);
   const [loadingBalances, setLoadingBalances] = useState(false);
 
-  // Add this useEffect to fetch balances when customer data is available
-  useEffect(() => {
-    const fetchBalances = async () => {
-      if (data?.customer?.email) {
-        setLoadingBalances(true);
-        const balances = await fetchCustomerBalances(data.customer.email, 'email');
-        setCustomerBalances(balances);
-        setLoadingBalances(false);
-      }
-    };
-    
-    fetchBalances();
-  }, [data?.customer?.email]);
-
-  // Get the currently logged-in user
   const currentUser = getUserFromStorage();
 
   // Helper function to get agent name for activity logging
@@ -497,41 +480,87 @@ export const ReturnDetailsPage = () => {
       const docRef = doc(db, 'returns', id);
       const docSnap = await getDoc(docRef);
 
-      if (docSnap.exists()) {
-        const firestoreData = { id: docSnap.id, ...docSnap.data() } as ReturnData;
-
-        if (firestoreData.orderId) {
-          const shopifyOrder = await fetchShopifyOrder(firestoreData.orderId);
-          if (shopifyOrder) {
-            setShopifyOrderData(shopifyOrder);
-            
-            const shipping = shopifyOrder.shipping_address;
-            const customer = shopifyOrder.customer;
-            
-            const shippingPhone = shipping?.phone || customer?.phone || shopifyOrder.phone || firestoreData.customer.phone;
-            const shippingEmail = shopifyOrder.contact_email || shopifyOrder.email || customer?.email || firestoreData.customer.email;
-
-            firestoreData.customer = {
-              ...firestoreData.customer,
-              email: shippingEmail,
-              phone: shippingPhone,
-              address: shipping ? [shipping.address1, shipping.address2].filter(Boolean).join(', ') : firestoreData.customer.address,
-              city: shipping?.city || firestoreData.customer.city,
-              state: shipping?.province || firestoreData.customer.state,
-              zip: shipping?.zip || firestoreData.customer.zip,
-              country: shipping?.country || firestoreData.customer.country,
-            };
-          }
-        }
-        setData(firestoreData);
-        await fetchActivities(id);
-      } else {
+      if (!docSnap.exists()) {
         setError('Return request not found.');
+        setLoading(false);
+        return;
       }
+
+      const firestoreData = { id: docSnap.id, ...docSnap.data() } as ReturnData;
+      
+      // 1. Instantly unblock the UI with the core Firestore data
+      setData(firestoreData);
+      setLoading(false); // Spinner disappears immediately!
+
+      // 2. Fetch everything else concurrently in the background
+      
+      // A. Fetch Activities
+      fetchActivities(id).catch(err => console.error("Error fetching activities:", err));
+
+      // B. Fetch Customer Balances
+      const initialEmail = firestoreData.customer?.email;
+      if (initialEmail) {
+        setLoadingBalances(true);
+        fetchCustomerBalances(initialEmail, 'email')
+          .then(balances => {
+            setCustomerBalances(balances);
+            setLoadingBalances(false);
+          })
+          .catch(err => {
+            console.error('Error fetching balances:', err);
+            setLoadingBalances(false);
+          });
+      }
+
+      // C. Fetch Shopify Enrichment Data
+      if (firestoreData.orderId) {
+        fetchShopifyOrder(firestoreData.orderId)
+          .then(shopifyOrder => {
+            if (shopifyOrder) {
+              setShopifyOrderData(shopifyOrder);
+              
+              const shipping = shopifyOrder.shipping_address;
+              const customer = shopifyOrder.customer;
+              
+              const shippingPhone = shipping?.phone || customer?.phone || shopifyOrder.phone || firestoreData.customer.phone;
+              const shippingEmail = shopifyOrder.contact_email || shopifyOrder.email || customer?.email || firestoreData.customer.email;
+
+              // Silently enrich the customer data in the UI
+              setData(prev => {
+                if (!prev) return prev;
+                return {
+                  ...prev,
+                  customer: {
+                    ...prev.customer,
+                    email: shippingEmail,
+                    phone: shippingPhone,
+                    address: shipping ? [shipping.address1, shipping.address2].filter(Boolean).join(', ') : prev.customer.address,
+                    city: shipping?.city || prev.customer.city,
+                    state: shipping?.province || prev.customer.state,
+                    zip: shipping?.zip || prev.customer.zip,
+                    country: shipping?.country || prev.customer.country,
+                  }
+                };
+              });
+
+              // If the email was missing initially but Shopify found it, fetch balances now
+              if (!initialEmail && shippingEmail) {
+                setLoadingBalances(true);
+                fetchCustomerBalances(shippingEmail, 'email')
+                  .then(balances => {
+                    setCustomerBalances(balances);
+                    setLoadingBalances(false);
+                  })
+                  .catch(() => setLoadingBalances(false));
+              }
+            }
+          })
+          .catch(err => console.error("Error fetching Shopify order:", err));
+      }
+
     } catch (err) {
       console.error("Error fetching document:", err);
       setError('Failed to load return details.');
-    } finally {
       setLoading(false);
     }
   };
