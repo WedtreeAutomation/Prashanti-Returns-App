@@ -159,6 +159,42 @@ const ImageCarousel = ({ images }: { images: string[] }) => {
   );
 };
 
+const compressImage = (file: File, maxWidth = 1024): Promise<File> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = (event) => {
+      const img = new Image();
+      img.src = event.target?.result as string;
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        // Calculate new dimensions maintaining aspect ratio
+        const scaleSize = maxWidth / img.width;
+        canvas.width = maxWidth;
+        canvas.height = img.height * scaleSize;
+        
+        const ctx = canvas.getContext('2d');
+        ctx?.drawImage(img, 0, 0, canvas.width, canvas.height);
+        
+        // Convert back to a file (0.7 = 70% JPEG quality)
+        canvas.toBlob((blob) => {
+          if (blob) {
+            const newFile = new File([blob], file.name.replace(/\.[^/.]+$/, "") + ".jpg", {
+              type: 'image/jpeg',
+              lastModified: Date.now(),
+            });
+            resolve(newFile);
+          } else {
+            resolve(file); // Fallback to original if compression fails
+          }
+        }, 'image/jpeg', 0.7); 
+      };
+      img.onerror = (error) => reject(error);
+    };
+    reader.onerror = (error) => reject(error);
+  });
+};
+
 // Format currency
 const formatCurrency = (amount: string | number): string => {
   const num = typeof amount === 'string' ? parseFloat(amount.replace(/[^0-9.]/g, '')) : amount;
@@ -524,18 +560,18 @@ export const ReturnPortalSplit = () => {
   // ==========================================
   // ENRICH ORDER WITH SHIPPING DETAILS
   // ==========================================
-  const enrichOrderWithDetails = useCallback(async (orderData: Order) => {
-    try {
-      const shopifyOrder = await fetchShopifyOrder(orderData.name);
-      if (shopifyOrder) {
-        setEnrichedOrderData(shopifyOrder);
-        return shopifyOrder;
-      }
-    } catch (error) {
-      console.error("Error enriching order data:", error);
-    }
-    return null;
-  }, []);
+  // const enrichOrderWithDetails = useCallback(async (orderData: Order) => {
+  //   try {
+  //     const shopifyOrder = await fetchShopifyOrder(orderData.name);
+  //     if (shopifyOrder) {
+  //       setEnrichedOrderData(shopifyOrder);
+  //       return shopifyOrder;
+  //     }
+  //   } catch (error) {
+  //     console.error("Error enriching order data:", error);
+  //   }
+  //   return null;
+  // }, []);
 
   // ==========================================
   // RETURN STATUS CHECKING
@@ -585,9 +621,8 @@ export const ReturnPortalSplit = () => {
   useEffect(() => {
     if (order?.name) {
       checkOrderReturnStatus(order.name);
-      enrichOrderWithDetails(order);
     }
-  }, [order?.name, checkOrderReturnStatus, enrichOrderWithDetails]);
+  }, [order?.name, checkOrderReturnStatus]);
 
   const canItemBeReturned = useCallback((orderName: string, itemId: number): { allowed: boolean; status?: string } => {
     const orderStatus = orderReturnStatus[orderName];
@@ -664,10 +699,14 @@ export const ReturnPortalSplit = () => {
 
     const uploadPromises = validFiles.map(async ({ file, idx }) => {
       try {
+        const compressedFile = await compressImage(file);
+        
         const timestamp = Date.now();
-        const sanitizedName = file.name.replace(/[^a-zA-Z0-9.]/g, '_');
+        const sanitizedName = compressedFile.name.replace(/[^a-zA-Z0-9.]/g, '_');
         const storageRef = ref(storage, `returns/${RAN}/${itemId}/${timestamp}_${idx}_${sanitizedName}`);
-        const snapshot = await uploadBytes(storageRef, file);
+        
+        // Upload the significantly smaller file
+        const snapshot = await uploadBytes(storageRef, compressedFile);
         return await getDownloadURL(snapshot.ref);
       } catch (error) {
         console.error(`Upload failed for item ${itemId} image ${idx}`, error);
@@ -681,42 +720,63 @@ export const ReturnPortalSplit = () => {
 
   const handleFileChange = useCallback((
     lineItemId: number,
-    index: number,
     e: React.ChangeEvent<HTMLInputElement>
   ) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
 
-    const validation = validateFile(file);
-    if (!validation.valid) {
-      alert(validation.error);
-      return;
-    }
+    // Reset the input value so the user can select the same files again if they removed them
+    e.target.value = '';
 
     setUploadFiles(prev => {
       const currentFiles = prev[lineItemId] || generateInitialImagesArray();
-      const existingCount = currentFiles.filter(f => f !== null).length;
+      const emptyCount = currentFiles.filter(f => f === null).length;
 
-      if (!currentFiles[index] && existingCount >= MAX_IMAGES) {
-        alert(`Maximum ${MAX_IMAGES} images allowed. Please remove an existing image first.`);
+      if (emptyCount === 0) {
+        alert(`Maximum ${MAX_IMAGES} images allowed.`);
         return prev;
       }
 
       const newFiles = [...currentFiles];
-      newFiles[index] = file;
+      let currentEmptyIdx = 0;
+
+      files.forEach(file => {
+        const validation = validateFile(file);
+        if (!validation.valid) {
+          alert(`Skipped ${file.name}: ${validation.error}`);
+          return;
+        }
+
+        // Find the next available empty slot
+        while (currentEmptyIdx < MAX_IMAGES && newFiles[currentEmptyIdx] !== null) {
+          currentEmptyIdx++;
+        }
+
+        // If we found an empty slot, assign the file and trigger the preview reader
+        if (currentEmptyIdx < MAX_IMAGES) {
+          newFiles[currentEmptyIdx] = file;
+          const targetIdx = currentEmptyIdx; 
+
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            setPreviews(p => {
+              const currentPreviews = p[lineItemId] || generateInitialImagesArray();
+              const newPreviews = [...currentPreviews];
+              newPreviews[targetIdx] = reader.result as string;
+              return { ...p, [lineItemId]: newPreviews };
+            });
+          };
+          reader.readAsDataURL(file);
+        }
+      });
+
+      // Warn if they tried to upload more files than available slots
+      if (files.length > emptyCount) {
+        alert(`Only up to ${MAX_IMAGES} images allowed. Some files were skipped.`);
+      }
+
       return { ...prev, [lineItemId]: newFiles };
     });
-
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      setPreviews(prev => {
-        const currentPreviews = prev[lineItemId] || generateInitialImagesArray();
-        const newPreviews = [...currentPreviews];
-        newPreviews[index] = reader.result as string;
-        return { ...prev, [lineItemId]: newPreviews };
-      });
-    };
-    reader.readAsDataURL(file);
   }, []);
 
   const removeImage = useCallback((lineItemId: number, index: number) => {
@@ -758,6 +818,25 @@ export const ReturnPortalSplit = () => {
           return;
         }
 
+        // Optimization: Use pre-fetched product details if the backend provided them
+        if (data.product_details) {
+          const formattedDetails: Record<number, { image: string | null, tags: string[] }> = {};
+          
+          // Use Object.entries to safely get both the key and the value
+          Object.entries(data.product_details).forEach(([key, value]) => {
+            formattedDetails[parseInt(key)] = value;
+          });
+          
+          setProductDetails(formattedDetails);
+        } else {
+          // Fallback just in case
+          await loadOrderProductDetails(data);
+        }
+
+        // Optimization: Set enrichedOrderData directly from the fetched data to skip extra network calls
+        setEnrichedOrderData(data);
+
+        // Synchronous check (will resolve instantly because data.shipping_address is already loaded)
         const isInIndia = await isOrderInIndia(data);
         if (!isInIndia) {
           showIneligibleModal(data.name, 'international');
@@ -765,7 +844,6 @@ export const ReturnPortalSplit = () => {
           return;
         }
 
-        await loadOrderProductDetails(data);
         setOrder(data);
         setStep('SELECT');
       } else {
@@ -1475,11 +1553,12 @@ export const ReturnPortalSplit = () => {
                     <div key={index} className="relative aspect-square">
                       <input
                         type="file"
+                        multiple
                         accept="image/jpeg,image/png,image/webp,image/heic"
-                        id={`file-${item.id}-${index}`}
+                        id={`file-multi-${item.id}`}
                         className="hidden"
-                        onChange={(e) => handleFileChange(item.id, index, e)}
-                        disabled={isDisabledUpload}
+                        onChange={(e) => handleFileChange(item.id, e)}
+                        disabled={uploadedCount >= MAX_IMAGES}
                       />
 
                       {hasFile ? (
@@ -1501,8 +1580,9 @@ export const ReturnPortalSplit = () => {
                           </span>
                         </div>
                       ) : (
+                        /* All empty slots point to the same multi-file input */
                         <label
-                          htmlFor={`file-${item.id}-${index}`}
+                          htmlFor={`file-multi-${item.id}`}
                           className={`
                             w-full h-full border border-dashed sm:border-2 rounded-lg sm:rounded-xl flex flex-col items-center justify-center 
                             transition-all cursor-pointer
@@ -1519,7 +1599,7 @@ export const ReturnPortalSplit = () => {
                           <span className={`text-[6px] sm:text-[10px] font-bold ${
                             isRequired ? 'text-[#5A0A38]' : 'text-slate-400'
                           }`}>
-                            {isRequired ? 'Req' : `Slot ${index + 1}`}
+                            {isRequired ? 'Req' : 'Add'}
                           </span>
                         </label>
                       )}
@@ -1535,7 +1615,7 @@ export const ReturnPortalSplit = () => {
                 </div>
               )}
             </div>
-          </div>
+          </div>  
         )}
       </div>
     );
