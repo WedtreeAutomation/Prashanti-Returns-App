@@ -10,9 +10,9 @@ import {
   getDocs, addDoc, updateDoc, Timestamp, serverTimestamp
 } from 'firebase/firestore';
 import { db } from '../../Interfaces/firebase';
-import { fetchShopifyOrder, restockShopifyItems, notifyReturnRejection, notifyItemRejection } from '../../Interfaces/api';
+import { fetchShopifyOrder, restockShopifyItems, notifyReturnRejection, notifyItemRejection, apiClient } from '../../Interfaces/api';
 import { ImageZoom } from '../Layout/ImageZoom';
-import { ExchangeModal } from '../../Modals/ExchangeModal';
+// import { ExchangeModal } from '../../Modals/ExchangeModal';
 import { RejectRequestModal } from '../../Modals/RejectRequestModal';
 import { IssueRefundModal } from '../../Modals/IssueRefundModal';
 import { CreatePickupModal } from '../../Modals/CreatePickupModal';
@@ -418,33 +418,18 @@ export const ReturnDetailsPage = () => {
   const [isMarkReceivedModalOpen, setIsMarkReceivedModalOpen] = useState(false);
   const [isIssueRefundModalOpen, setIsIssueRefundModalOpen] = useState(false);
   const [labelPreview, setLabelPreview] = useState<string | null>(null);
-  const [isExchangeModalOpen, setIsExchangeModalOpen] = useState(false);
+  // const [isExchangeModalOpen, setIsExchangeModalOpen] = useState(false);
   const [isCancelPickupModalOpen, setIsCancelPickupModalOpen] = useState(false);
   const [itemToReject, setItemToReject] = useState<{ id: number; item: ReturnItem } | undefined>(undefined);
 
   const fetchCustomerBalances = async (identifier: string, identifierType: 'email' | 'phone' = 'email'): Promise<CustomerBalances | null> => {
     try {
-      const apiKey = import.meta.env.VITE_FLASK_API_KEY;
-      const apiUrl = import.meta.env.VITE_FLASK_API_URL;
-      
-      const response = await fetch(`${apiUrl}/customer/balances`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-API-Key': apiKey || '',
-        },
-        body: JSON.stringify({
-          identifier: identifier,
-          identifierType: identifierType
-        })
+      const response = await apiClient.post('/customer/balances', {
+        identifier: identifier.trim(),
+        identifierType: identifierType
       });
       
-      if (!response.ok) {
-        throw new Error(`Failed to fetch balances: ${response.status}`);
-      }
-      
-      const data = await response.json();
-      return data;
+      return response.data;
     } catch (error) {
       console.error('Error fetching customer balances:', error);
       return null;
@@ -920,12 +905,12 @@ export const ReturnDetailsPage = () => {
 
           <div className="flex flex-wrap items-center gap-2">
             <button onClick={() => setIsRejectModalOpen(true)} className="px-3 py-1.5 bg-white border border-slate-200 text-slate-700 hover:bg-red-50 hover:text-red-600 text-xs font-medium rounded-lg flex items-center gap-1.5 shadow-sm whitespace-nowrap"><X className="w-3.5 h-3.5" /> Reject</button>
-            <button
+            {/* <button
               onClick={() => setIsExchangeModalOpen(true)}
               className="px-3 py-1.5 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 text-white text-xs font-medium rounded-lg flex items-center gap-1.5 shadow-md whitespace-nowrap"
             >
               <RefreshCw className="w-3.5 h-3.5" /> Convert to Exchange
-            </button>
+            </button> */}
             <div className="relative">
               <button onClick={() => setIsMenuOpen(!isMenuOpen)} className="px-3 py-1.5 bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-700 hover:to-cyan-700 text-white text-xs font-medium rounded-lg flex items-center gap-1.5 shadow-md whitespace-nowrap">
                 <Truck className="w-3.5 h-3.5" /> Reverse Shipment <ChevronDown className={`w-3.5 h-3.5 transition-transform ${isMenuOpen ? 'rotate-180' : ''}`} />
@@ -1289,14 +1274,14 @@ export const ReturnDetailsPage = () => {
         itemToReject={itemToReject?.item}
       />
 
-      <ExchangeModal
+      {/* <ExchangeModal
         isOpen={isExchangeModalOpen}
         onClose={() => setIsExchangeModalOpen(false)}
         orderId={data.id}
         data={data}
         currentUser={currentUser}
         onSuccess={fetchReturnDetails}
-      />
+      /> */}
 
       <MarkReceivedModal
         isOpen={isMarkReceivedModalOpen}
