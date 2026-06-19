@@ -2244,6 +2244,7 @@ def generate_waybill():
             response_data = {"raw_response": response.text}
         
         if response.status_code != 200:
+            logger.error(f"BlueDart waybill generation failed (HTTP {response.status_code}) for RAN={ran}: {response_data}")
             return jsonify({"success": False, "error": "Waybill generation failed", "response": response_data}), 400
         
         result = response_data.get("GenerateWayBillResult", response_data)
