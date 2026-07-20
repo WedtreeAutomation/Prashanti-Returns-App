@@ -1,22 +1,28 @@
 import os
 import logging
+import io
+import zipfile
 import re
+import random
 import urllib.parse
 import requests
 from typing import Optional, Dict, Any, List, Union
 from functools import wraps
 from dataclasses import dataclass, asdict
 from enum import Enum
-from datetime import datetime
-from flask import Flask, request, jsonify, g
+from datetime import datetime, timedelta, timezone
+from flask import Flask, request, jsonify, g, Response
 from flask_cors import CORS
 from dotenv import load_dotenv
 from firebase_functions import https_fn
+from google.cloud.firestore_v1.base_query import FieldFilter
 import threading
 import firebase_admin
 from firebase_admin import credentials, firestore, storage as fb_storage
 
 load_dotenv()
+
+N8N_OTP_WEBHOOK = os.environ.get('N8N_OTP_WEBHOOK')
 
 app = Flask(__name__)
 CORS(app, origins=[
@@ -76,6 +82,19 @@ SHOPIFY_STORE = os.environ.get('VITE_SHOPIFY_SHOP_DOMAIN')
 SHOPIFY_ACCESS_TOKEN = os.environ.get('VITE_SHOPIFY_ACCESS_TOKEN')
 SHOPIFY_API_VERSION = os.environ.get('VITE_SHOPIFY_API_VERSION')
 SHOPIFY_BASE_URL = f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_API_VERSION}"
+SHOPIFY_GRAPHQL_URL = f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+
+# ==========================================================
+# SHARED HTTP SESSION
+# Created ONCE per cold start and reused by every warm invocation on this
+# instance, so the TCP/TLS connection to Shopify stays alive (keep-alive)
+# instead of being renegotiated on every request.
+# ==========================================================
+shopify_session = requests.Session()
+shopify_session.headers.update({
+    'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
+    'Content-Type': 'application/json'
+})
 
 # Webhook URLs
 N8N_RETURN_APPLIED_WEBHOOK = os.environ.get('N8N_RETURN_APPLIED_WEBHOOK')
@@ -181,6 +200,121 @@ def trigger_webhook(url, payload, log_context):
     # Immediately return True to the frontend
     return True
 
+def _is_allowed_download_host(hostname: Optional[str]) -> bool:
+    """Restrict the download proxy to known-safe hosts (Shopify CDN, Firebase Storage)
+    so this authenticated endpoint can't be abused as an open SSRF relay."""
+    if not hostname:
+        return False
+    hostname = hostname.lower()
+    allowed_suffixes = (
+        'shopify.com', 'shopifycdn.com', 'myshopify.com',
+        'firebasestorage.googleapis.com', 'storage.googleapis.com', 'firebasestorage.app',
+    )
+    return any(hostname == s or hostname.endswith('.' + s) for s in allowed_suffixes)
+
+
+def _safe_filename(name: str, fallback: str = 'file') -> str:
+    name = (name or '').strip()
+    name = re.sub(r'[^A-Za-z0-9_.\-]', '_', name)
+    return name or fallback
+
+
+@app.route('/api/download/image', methods=['GET'])
+@require_api_key
+def download_image():
+    """Proxy-download a single remote image (Shopify CDN / Firebase Storage).
+
+    Browsers ignore the `download` attribute on cross-origin links, which is why the
+    product-image button was opening a new tab instead of saving the file. Fetching
+    the bytes server-to-server (no CORS involved) and returning them with
+    Content-Disposition: attachment forces a real download.
+    """
+    try:
+        image_url = request.args.get('url')
+        filename = _safe_filename(request.args.get('filename', ''), 'image.jpg')
+
+        if not image_url:
+            return jsonify({'error': 'Missing url parameter'}), 400
+
+        parsed = urllib.parse.urlparse(image_url)
+        if parsed.scheme != 'https' or not _is_allowed_download_host(parsed.hostname):
+            return jsonify({'error': 'This URL host is not allowed for download'}), 400
+
+        upstream = requests.get(image_url, timeout=20)
+        if upstream.status_code != 200:
+            return jsonify({'error': f'Failed to fetch image (status {upstream.status_code})'}), 502
+
+        return Response(
+            upstream.content,
+            mimetype=upstream.headers.get('Content-Type', 'application/octet-stream'),
+            headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+        )
+    except Exception as e:
+        logger.error(f"Error downloading image: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/download/images-zip', methods=['POST'])
+@require_api_key
+def download_images_zip():
+    """Bundle multiple remote images (customer-uploaded return photos from Firebase
+    Storage) into a single ZIP named after the order, fetched server-side to bypass
+    the browser CORS restriction that blocks direct cross-origin downloads."""
+    try:
+        data = request.get_json() or {}
+        images = data.get('images', [])
+        zip_filename = _safe_filename(data.get('zipFilename', ''), 'images')
+
+        if not images:
+            return jsonify({'error': 'No images provided'}), 400
+
+        mem_zip = io.BytesIO()
+        used_names = set()
+        fetched_count = 0
+
+        with zipfile.ZipFile(mem_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for idx, img in enumerate(images):
+                url = (img or {}).get('url')
+                if not url:
+                    continue
+
+                parsed = urllib.parse.urlparse(url)
+                if parsed.scheme != 'https' or not _is_allowed_download_host(parsed.hostname):
+                    logger.warning(f"Skipping disallowed download host: {url}")
+                    continue
+
+                try:
+                    upstream = requests.get(url, timeout=20)
+                    if upstream.status_code != 200:
+                        continue
+
+                    name = _safe_filename(img.get('filename', ''), f'image_{idx + 1}.jpg')
+                    base, ext = os.path.splitext(name)
+                    final_name, counter = name, 1
+                    while final_name in used_names:
+                        final_name = f"{base}_{counter}{ext}"
+                        counter += 1
+                    used_names.add(final_name)
+
+                    zf.writestr(final_name, upstream.content)
+                    fetched_count += 1
+                except Exception as inner_e:
+                    logger.warning(f"Skipping image {url}: {inner_e}")
+                    continue
+
+        if fetched_count == 0:
+            return jsonify({'error': 'Failed to fetch any of the requested images'}), 502
+
+        mem_zip.seek(0)
+        return Response(
+            mem_zip.read(),
+            mimetype='application/zip',
+            headers={'Content-Disposition': f'attachment; filename="{zip_filename}.zip"'}
+        )
+    except Exception as e:
+        logger.error(f"Error creating images zip: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+    
 # ==========================================================
 # REFUND CLASSES (From Your Provided Code)
 # ==========================================================
@@ -220,6 +354,13 @@ class ShopifyService:
         self.access_token = access_token
         self.api_version = api_version
         self.graphql_endpoint = f"https://{shop_domain}/admin/api/{api_version}/graphql.json"
+        
+        # Connection Pooling (Keeps the SSL connection warm)
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "X-Shopify-Access-Token": self.access_token,
+        })
         
         self._init_graphql_queries()
     
@@ -375,58 +516,39 @@ class ShopifyService:
           }
         }
         """
-        
-        self.GET_CUSTOMER_STORE_CREDIT_ACCOUNT = """
-        query GetCustomerStoreCreditAccount($customerId: ID!) {
-          customer(id: $customerId) {
-            id
-            email
-            storeCreditAccounts(first: 1) {
-              edges {
-                node {
-                  id
-                  balance {
-                    amount
-                    currencyCode
-                  }
-                }
-              }
-            }
-          }
-        }
-        """
     
     def _make_graphql_request(self, query: str, variables: Optional[Dict] = None) -> Dict:
-        headers = {
-            "Content-Type": "application/json",
-            "X-Shopify-Access-Token": self.access_token,
-        }
-        
         payload = {"query": query}
         if variables:
             payload["variables"] = variables
         
         try:
-            response = requests.post(
+            response = self.session.post(
                 self.graphql_endpoint,
                 json=payload,
-                headers=headers,
-                timeout=30
+                timeout=15 
             )
-            response.raise_for_status()
+            
+            if response.status_code != 200:
+                logger.error(f"Shopify HTTP Error {response.status_code}: {response.text}")
+                response.raise_for_status()
+                
             data = response.json()
             
             if "errors" in data:
                 error_messages = [e.get("message", "Unknown error") for e in data["errors"]]
                 logger.error(f"GraphQL errors: {error_messages}")
-                raise Exception(f"GraphQL errors: {', '.join(error_messages)}")
+                raise Exception(f"GraphQL error: {', '.join(error_messages)}")
             
             return data.get("data", {})
             
+        except requests.exceptions.Timeout:
+            logger.error("Shopify GraphQL API timed out.")
+            raise Exception("Shopify API timed out. Please try again.")
         except Exception as e:
             logger.error(f"Request failed: {str(e)}")
             raise
-    
+
     def get_order_details(self, order_gid: str) -> Dict:
         try:
             result = self._make_graphql_request(
@@ -440,24 +562,6 @@ class ShopifyService:
             return result["order"]
         except Exception as e:
             logger.error(f"Failed to fetch order details: {str(e)}")
-            raise
-    
-    def get_customer_store_credit_account(self, customer_id: str) -> Optional[Dict]:
-        try:
-            result = self._make_graphql_request(
-                self.GET_CUSTOMER_STORE_CREDIT_ACCOUNT,
-                variables={"customerId": customer_id}
-            )
-            
-            customer = result.get("customer", {})
-            accounts = customer.get("storeCreditAccounts", {}).get("edges", [])
-            
-            if accounts:
-                return accounts[0].get("node", {})
-            
-            return None
-        except Exception as e:
-            logger.error(f"Failed to fetch store credit account: {str(e)}")
             raise
     
     def create_gift_card(self, initial_value: Union[str, float], customer_id: Optional[str] = None, note: Optional[str] = None) -> Dict:
@@ -497,7 +601,6 @@ class ShopifyService:
     def refund_to_original_payment(self, order_gid: str, refund_amount: Union[str, float], currency_code: str, 
                                    parent_transaction_id: str, gateway: str,
                                    notify: Optional[bool] = None, note: Optional[str] = None) -> Dict:
-        """Process a financial-only refund to enforce custom deductions."""
         if isinstance(refund_amount, (int, float)):
             refund_amount = f"{refund_amount:.2f}"
         
@@ -505,11 +608,11 @@ class ShopifyService:
             "orderId": order_gid,
             "transactions": [
                 {
-                    "orderId": order_gid,              # ✅ ADDED: Shopify requires the orderId inside the transaction too
+                    "orderId": order_gid,
                     "parentId": parent_transaction_id,
                     "kind": "REFUND",
                     "gateway": gateway,
-                    "amount": str(refund_amount),      # ✅ FIXED: Passed as a direct string, not a dictionary
+                    "amount": str(refund_amount), 
                 }
             ],
             "notify": notify if notify is not None else True
@@ -568,26 +671,75 @@ class ShopifyService:
         except Exception as e:
             logger.error(f"Failed to add store credit: {str(e)}")
             raise
-    
 
-    def update_firebase_with_refund(self, refund_result: RefundResult, metadata: Optional[Dict] = None) -> bool:
-        if not db:
-            return False
+    def cancel_shopify_order(self, order_id: str) -> bool:
+        """Explicitly cancels the order in Shopify for Full Returns"""
+        # Extract numeric ID if GID is passed
+        numeric_id = order_id.split("/")[-1] if "gid://" in order_id else order_id
+        cancel_url = f"https://{self.shop_domain}/admin/api/{self.api_version}/orders/{numeric_id}/cancel.json"
         
         try:
-            order_id = metadata.get('orderId') if metadata else None
-            if not order_id:
+            # Sending an empty payload to the cancel endpoint cancels the order
+            response = self.session.post(cancel_url, json={})
+            if response.status_code == 200:
+                logger.info(f"Successfully cancelled full return order: {numeric_id}")
+                return True
+            else:
+                logger.warning(f"Failed to cancel order {numeric_id}: {response.text}")
                 return False
-            
-            # Extract agent name from metadata
-            agent_name = metadata.get('agentName', 'System') if metadata else 'System'
-            
-            return_ref = db.collection('returns').document(order_id)
-            return_doc = return_ref.get()
-            
-            if not return_doc.exists:
+        except Exception as e:
+            logger.error(f"Exception cancelling order {numeric_id}: {str(e)}")
+            return False
+
+    def update_firebase_with_refund(self, refund_result: RefundResult, metadata: Optional[Dict] = None) -> bool:
+        """Update the Firestore return document after a successful refund.
+
+        Resolves the target document by its Firestore doc ID (metadata['orderId']),
+        falling back to a lookup by RAN (metadata['RAN']) if the direct ID doesn't
+        match. Also handles Shopify Order Cancellation for Full Returns.
+        """
+        if not db:
+            return False
+
+        metadata = metadata or {}
+        order_id = metadata.get('orderId')
+        ran = metadata.get('RAN')
+        agent_name = metadata.get('agentName', 'System')
+        
+        # 1. Extract Full/Partial return flag and determine expected statuses
+        is_full_return = metadata.get('isFullReturn', False)
+        return_type = "Full Return" if is_full_return else "Partial Return"
+        expected_fulfillment = "Unfulfilled" if is_full_return else "Partially Fulfilled"
+
+        if not order_id and not ran:
+            logger.error("update_firebase_with_refund: no orderId or RAN in metadata — cannot locate return document")
+            return False
+
+        # 2. Trigger Condition 1: Cancel Order if Full Return
+        # We do this before the Firebase update to ensure the Shopify API call succeeds
+        if is_full_return and order_id:
+            self.cancel_shopify_order(order_id)
+
+        try:
+            return_ref = None
+
+            # Locate the document via order_id
+            if order_id:
+                candidate_ref = db.collection('returns').document(order_id)
+                if candidate_ref.get().exists:
+                    return_ref = candidate_ref
+
+            # Fallback: Locate via RAN
+            if return_ref is None and ran:
+                docs = list(db.collection('returns').where('RAN', '==', ran).limit(1).stream())
+                if docs:
+                    return_ref = docs[0].reference
+
+            if return_ref is None:
+                logger.error(f"update_firebase_with_refund: no matching return document for orderId={order_id!r}, RAN={ran!r}")
                 return False
-            
+
+            # 3. Append the new returnType and expectedFulfillment fields to refund details
             refund_details = {
                 'method': refund_result.refund_method.value,
                 'finalAmount': float(refund_result.amount) if refund_result.amount else 0,
@@ -596,8 +748,15 @@ class ShopifyService:
                 'giftCardCode': refund_result.gift_card_code,
                 'transactions': refund_result.transactions,
                 'shopifyResponse': refund_result.raw_response,
+                'returnType': return_type,
+                'expectedFulfillment': expected_fulfillment,
+                'isFullReturn': is_full_return,
+                'baseAmount': metadata.get('baseAmount', 0),
+                'shippingRefundAddition': metadata.get('shippingRefundAddition', 0),
+                'deductions': metadata.get('deductions', {}),
+                'quantityMultiplied': metadata.get('quantityMultiplied', {})
             }
-            
+
             update_data = {
                 'refundStatus': 'Refunded',
                 'status': 'completed',
@@ -607,41 +766,41 @@ class ShopifyService:
                 'refundAmount': float(refund_result.amount) if refund_result.amount else 0,
                 'refundCompletedAt': firestore.SERVER_TIMESTAMP,
                 'shopifyRefundId': refund_result.refund_id,
+                'returnType': return_type,  # Placed at root level for easy querying & Excel exports
             }
-            
+
             if refund_result.gift_card_code:
                 update_data['giftCardCode'] = refund_result.gift_card_code
-            
+
             return_ref.update(update_data)
-            
-            # Updated to use agent_name instead of hardcoded 'System'[cite: 10]
-            activities_ref = db.collection('returns').document(order_id).collection('activities')
-            activities_ref.add({
+
+            # 4. Add an activity log entry noting the specific return type
+            return_ref.collection('activities').add({
                 'type': 'success',
                 'title': 'Refund Issued',
-                'description': f"Refund of ₹{float(refund_result.amount):.2f} issued via {refund_result.refund_method.value.replace('_', ' ')}",
+                'description': f"Refund of ₹{float(refund_result.amount):.2f} issued via {refund_result.refund_method.value.replace('_', ' ')} ({return_type})",
                 'timestamp': firestore.SERVER_TIMESTAMP,
                 'user': agent_name,
                 'metadata': refund_details
             })
-            
+
             return True
         except Exception as e:
-            logger.error(f"Firebase update failed: {str(e)}")
+            logger.error(f"Firebase update failed for refund (orderId={order_id!r}, RAN={ran!r}): {str(e)}")
             return False
         
     def process_refund(self, order_gid: str, amount: Union[str, float], refund_method: RefundMethod, 
                        line_item_refunds: List[Dict], note: str, notify_customer: bool, metadata: Dict) -> RefundResult:
         """Centralized processor for non-original payment refunds (Store Credit & Gift Card)"""
         try:
-            # 1. Fetch necessary order details
             order_details = self.get_order_details(order_gid)
-            customer = order_details.get('customer', {})
+            
+            # --- SAFE DATA EXTRACTION ---
+            customer = order_details.get('customer') or {}
             customer_id = customer.get('id')
             customer_email = order_details.get('email') or customer.get('email')
             currency = order_details.get('totalPriceSet', {}).get('shopMoney', {}).get('currencyCode', 'INR')
             
-            # Set up our baseline result
             result_kwargs = {
                 'success': True,
                 'refund_method': refund_method,
@@ -651,7 +810,6 @@ class ShopifyService:
                 'order_name': order_details.get('name')
             }
 
-            # 2. Route based on the refund method
             if refund_method == RefundMethod.GIFT_CARD:
                 if not customer_id:
                     raise ValueError("A customer ID is required to issue a Gift Card.")
@@ -666,12 +824,11 @@ class ShopifyService:
                 if not customer_id:
                     raise ValueError("A customer ID is required to issue Store Credit.")
                 
-                account = self.get_customer_store_credit_account(customer_id)
-                if not account:
-                    raise ValueError("No active store credit account found for this customer.")
-                
+                # --- AUTO-CREATE FIX ---
+                # Shopify automatically creates the store credit account if it doesn't exist
+                # as long as we pass the customer_id directly into the credit mutation!
                 transaction = self.create_store_credit_account_credit(
-                    account_id=account['id'],
+                    account_id=customer_id, 
                     amount=amount,
                     currency_code=currency,
                     notify=notify_customer
@@ -683,7 +840,6 @@ class ShopifyService:
             else:
                 raise ValueError(f"Unsupported custom refund method: {refund_method.value}")
 
-            # 3. Create the result object and update Firebase
             refund_result = RefundResult(**result_kwargs)
             firebase_updated = self.update_firebase_with_refund(refund_result, metadata)
             refund_result.firebase_updated = firebase_updated
@@ -697,15 +853,12 @@ class ShopifyService:
                 refund_method=refund_method, 
                 error_message=str(e)
             )
-        
-    
-
-
+             
 def get_shopify_service():
     """Get or create Shopify service instance"""
-    shop_domain = os.getenv('SHOPIFY_SHOP_DOMAIN', SHOPIFY_STORE)
-    access_token = os.getenv('SHOPIFY_ACCESS_TOKEN', SHOPIFY_ACCESS_TOKEN)
-    api_version = os.getenv('SHOPIFY_API_VERSION', SHOPIFY_API_VERSION)
+    shop_domain = os.getenv('VITE_SHOPIFY_SHOP_DOMAIN')
+    access_token = os.getenv('VITE_SHOPIFY_ACCESS_TOKEN')
+    api_version = os.getenv('VITE_SHOPIFY_API_VERSION')
     
     if not shop_domain or not access_token:
         raise ValueError("Shopify credentials not configured")
@@ -717,17 +870,18 @@ def get_shopify_service():
 # BLUE DART CONFIGURATION
 # ==========================================================
 class BlueDartConfig:
-    BLUEDART_TOKEN_URL = "https://apigateway.bluedart.com/in/transportation/token/v1/login"
-    BLUEDART_WAYBILL_URL = "https://apigateway.bluedart.com/in/transportation/waybill/v1/GenerateWayBill"
-    BLUEDART_CANCEL_WAYBILL_URL = "https://apigateway.bluedart.com/in/transportation/waybill/v1/CancelWaybill"
-    BLUEDART_CANCEL_PICKUP_URL = "https://apigateway.bluedart.com/in/transportation/cancel-pickup/v1/CancelPickup" 
-    BLUEDART_TRACKING_URL = "https://apigateway.bluedart.com/in/transportation/tracking/v1/shipment"
-    
+    BLUEDART_TOKEN_URL = os.getenv("BLUEDART_TOKEN_URL")
+    BLUEDART_WAYBILL_URL = os.getenv("BLUEDART_WAYBILL_URL")
+    BLUEDART_CANCEL_WAYBILL_URL = os.getenv("BLUEDART_CANCEL_WAYBILL_URL")
+    BLUEDART_CANCEL_PICKUP_URL = os.getenv("BLUEDART_CANCEL_PICKUP_URL")
+    BLUEDART_TRACKING_URL = os.getenv("BLUEDART_TRACKING_URL")
+
     BD_CLIENT_ID = os.getenv("BD_CLIENT_ID")
     BD_CLIENT_SECRET = os.getenv("BD_CLIENT_SECRET")
     BD_LOGIN_ID = os.getenv("BD_LOGIN_ID")
     BD_LICENCE_KEY = os.getenv("BD_LICENCE_KEY")
-    BD_CUSTOMER_CODE = os.getenv("BD_CUSTOMER_CODE", "503705")
+    BD_TRACKING_LICENSE_KEY = os.getenv("BD_TRACKING_LICENSE_KEY") 
+    BD_CUSTOMER_CODE = os.getenv("BD_CUSTOMER_CODE")
     
     REQUEST_TIMEOUT = 30
 
@@ -853,74 +1007,190 @@ def get_delivery_date_by_name(order_name):
         
     return None
 
-def get_extended_order_info(order_name):
-    """Fetch the delivery date and product details (images, tags) in one query."""
-    graphql_url = f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
-    
-    graphql_query = """
-    query GetOrderByName($searchQuery: String!) {
-      orders(first: 1, query: $searchQuery) {
+# --- OPTIMIZED: single GraphQL round trip instead of REST search + a second GraphQL call ---
+VERIFY_ORDER_QUERY = """
+query VerifyOrderByName($searchQuery: String!) {
+  orders(first: 1, query: $searchQuery) {
+    nodes {
+      legacyResourceId
+      name
+      email
+      phone
+      displayFulfillmentStatus
+      displayFinancialStatus
+      tags
+      createdAt
+      currencyCode
+      totalPriceSet {
+        shopMoney {
+          amount
+        }
+      }
+      customer {
+        firstName
+        lastName
+        displayName
+        email
+        phone
+      }
+      shippingAddress {
+        address1
+        address2
+        city
+        province
+        provinceCode
+        zip
+        country
+        phone
+        firstName
+        lastName
+      }
+      fulfillments(first: 10) {
+        deliveredAt
+      }
+      lineItems(first: 50) {
         nodes {
-          fulfillments(first: 50) {
-            deliveredAt
+          id
+          name
+          quantity
+          sku
+          variant {
+            title
           }
-          lineItems(first: 50) {
-            nodes {
-              product {
-                legacyResourceId
-                tags
-                featuredImage {
-                  url
-                }
-              }
+          originalUnitPriceSet {
+            shopMoney {
+              amount
+            }
+          }
+          product {
+            legacyResourceId
+            tags
+            featuredImage {
+              url
             }
           }
         }
       }
     }
+  }
+}
+"""
+
+
+def _gid_to_numeric_id(gid: Optional[str]) -> Optional[int]:
+    """gid://shopify/LineItem/123456789 -> 123456789 (LineItem has no legacyResourceId field)"""
+    if not gid:
+        return None
+    try:
+        return int(gid.rsplit('/', 1)[-1])
+    except (ValueError, IndexError):
+        return None
+
+
+def fetch_order_by_name_graphql(order_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch everything the customer page needs (order, line items, product
+    images/tags, delivery date, customer, shipping address) in ONE Shopify
+    GraphQL request, then reshape it into the same REST-style dict the
+    frontend already expects. This replaces the old REST search + second
+    GraphQL call, cutting the Shopify round trips for this endpoint in half.
     """
     variables = {"searchQuery": f"name:'{order_name}'"}
-    extended_info = {"delivered_at": None, "product_details": {}}
-    
-    try:
-        response = requests.post(
-            graphql_url, 
-            headers=shopify_headers(), 
-            json={"query": graphql_query, "variables": variables},
-            timeout=10
-        )
-        if response.status_code == 200:
-            data = response.json()
-            orders = data.get("data", {}).get("orders", {}).get("nodes", [])
-            
-            if orders:
-                order = orders[0]
-                
-                # 1. Get delivery date
-                for fulfillment in order.get("fulfillments", []):
-                    if fulfillment.get("deliveredAt"):
-                        extended_info["delivered_at"] = fulfillment["deliveredAt"]
-                        break
-                
-                # 2. Extract product images and tags
-                for item in order.get("lineItems", {}).get("nodes", []):
-                    product = item.get("product")
-                    if product:
-                        legacy_id = product.get("legacyResourceId")
-                        if legacy_id:
-                            extended_info["product_details"][str(legacy_id)] = {
-                                "image": product.get("featuredImage", {}).get("url") if product.get("featuredImage") else None,
-                                "tags": product.get("tags", [])
-                            }
-    except Exception as e:
-        logger.error(f"Failed to fetch extended info for {order_name}: {e}")
-        
-    return extended_info
+
+    response = shopify_session.post(
+        SHOPIFY_GRAPHQL_URL,
+        json={"query": VERIFY_ORDER_QUERY, "variables": variables},
+        timeout=10
+    )
+    response.raise_for_status()
+
+    payload = response.json()
+    if "errors" in payload:
+        logger.error(f"GraphQL errors fetching order {order_name}: {payload['errors']}")
+        raise RuntimeError("Shopify GraphQL error")
+
+    nodes = payload.get("data", {}).get("orders", {}).get("nodes", [])
+    node = next((o for o in nodes if o.get("name") == order_name), None)
+    if not node:
+        return None
+
+    # --- delivery date ---
+    delivered_at = None
+    for fulfillment in node.get("fulfillments", []):
+        if fulfillment.get("deliveredAt"):
+            delivered_at = fulfillment["deliveredAt"]
+            break
+
+    # --- line items + product image/tags ---
+    line_items = []
+    product_details: Dict[str, Any] = {}
+    for li in node.get("lineItems", {}).get("nodes", []):
+        variant = li.get("variant") or {}
+        product = li.get("product") or {}
+        price = (li.get("originalUnitPriceSet") or {}).get("shopMoney", {}).get("amount", "0.00")
+
+        legacy_product_id = product.get("legacyResourceId")
+        line_items.append({
+            "id": _gid_to_numeric_id(li.get("id")),
+            "title": li.get("name"),
+            "quantity": li.get("quantity"),
+            "price": price,
+            "sku": li.get("sku"),
+            "variant_title": variant.get("title"),
+            "product_id": legacy_product_id,
+        })
+
+        if legacy_product_id:
+            product_details[str(legacy_product_id)] = {
+                "image": (product.get("featuredImage") or {}).get("url"),
+                "tags": product.get("tags", [])
+            }
+
+    # --- customer / shipping address (always dicts, never None, so
+    #     verify_order_ownership's .get() chain below can't blow up) ---
+    customer = node.get("customer") or {}
+    shipping = node.get("shippingAddress") or {}
+
+    return {
+        "id": node.get("legacyResourceId"),
+        "name": node.get("name"),
+        "email": node.get("email"),
+        "phone": node.get("phone"),
+        "tags": ", ".join(node.get("tags") or []),
+        "currency": node.get("currencyCode"),
+        "total_price": (node.get("totalPriceSet") or {}).get("shopMoney", {}).get("amount"),
+        "created_at": node.get("createdAt"),
+        "delivered_at": delivered_at,
+        "financial_status": (node.get("displayFinancialStatus") or "").lower(),
+        "fulfillment_status": (node.get("displayFulfillmentStatus") or "").lower(),
+        "line_items": line_items,
+        "customer": {
+            "first_name": customer.get("firstName"),
+            "last_name": customer.get("lastName"),
+            "name": customer.get("displayName"),
+            "email": customer.get("email"),
+            "phone": customer.get("phone"),
+        },
+        "shipping_address": {
+            "address1": shipping.get("address1"),
+            "address2": shipping.get("address2"),
+            "city": shipping.get("city"),
+            "province": shipping.get("province"),
+            "province_code": shipping.get("provinceCode"),
+            "zip": shipping.get("zip"),
+            "country": shipping.get("country"),
+            "phone": shipping.get("phone"),
+            "first_name": shipping.get("firstName"),
+            "last_name": shipping.get("lastName"),
+        },
+        "product_details": product_details,
+    }
+
 
 @app.route('/api/orders/verify', methods=['POST'])
 @require_api_key
 def verify_order():
-    """Verify order by name and customer identifier"""
+    """Verify order by name and customer identifier — single GraphQL round trip"""
     try:
         data = request.get_json()
         order_name = data.get('orderName')
@@ -929,35 +1199,10 @@ def verify_order():
         if not order_name or not verification_input:
             return jsonify({'error': 'Missing required fields'}), 400
         
-        params = {
-            'name': order_name,
-            'status': 'any',
-            'fields': 'id,name,email,phone,customer,line_items,fulfillment_status,created_at,shipping_address,tags,currency,order_number,total_price'
-        }
-        
-        response = requests.get(
-            f"{SHOPIFY_BASE_URL}/orders.json",
-            headers=shopify_headers(),
-            params=params,
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            return jsonify({'error': 'Failed to fetch order'}), 500
-        
-        orders = response.json().get('orders', [])
-        matched_order = next((o for o in orders if o.get('name') == order_name), None)
-        
+        matched_order = fetch_order_by_name_graphql(order_name)
+
         if not matched_order or matched_order.get('fulfillment_status') != 'fulfilled':
             return jsonify({'error': 'Order not found or not fulfilled'}), 404
-        
-        # --- NEW CODE: Attach extended details from GraphQL ---
-        extended_info = get_extended_order_info(matched_order.get('name'))
-        if extended_info['delivered_at']:
-            matched_order['delivered_at'] = extended_info['delivered_at']
-        if extended_info['product_details']:
-            matched_order['product_details'] = extended_info['product_details']
-        # ------------------------------------------------
         
         if verify_order_ownership(matched_order, verification_input):
             return jsonify({'order': matched_order})
@@ -968,6 +1213,52 @@ def verify_order():
         logger.error(f"Error verifying order: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
 
+@app.route('/api/orders/<int:order_id>/order-note', methods=['POST'])
+@require_api_key
+def update_order_note(order_id):
+    """
+    Shopify API does not support native Timeline comments for apps via REST.
+    Workaround: Overwrite the note to trigger a clean timeline event, 
+    then immediately revert it to preserve original customer instructions.
+    """
+    try:
+        data = request.get_json()
+        event_title = data.get('eventTitle', 'Update')
+        message = data.get('message', '')
+        ran = data.get('ran', 'Unknown')
+
+        # 1. Fetch the existing order to get the original customer note
+        response = shopify_session.get(f"{SHOPIFY_BASE_URL}/orders/{order_id}.json", timeout=10)
+        
+        if response.status_code != 200:
+            return jsonify({'error': 'Failed to fetch order'}), 500
+        
+        order_data = response.json().get('order', {})
+        original_note = order_data.get('note') or ""
+        
+        # 2. Format the clean message we want to inject into the timeline
+        timeline_message = f"📦 [RAN: {ran}] {event_title}\n{message}"
+        
+        shopify_session.put(
+            f"{SHOPIFY_BASE_URL}/orders/{order_id}.json",
+            json={"order": {"id": order_id, "note": timeline_message}},
+            timeout=10
+        )
+        
+        update_res = shopify_session.put(
+            f"{SHOPIFY_BASE_URL}/orders/{order_id}.json",
+            json={"order": {"id": order_id, "note": original_note}},
+            timeout=10
+        )
+        
+        if update_res.status_code == 200:
+            return jsonify({'success': True})
+            
+        return jsonify({'error': 'Failed to revert Shopify note'}), 500
+    except Exception as e:
+        logger.error(f"Error updating note: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+     
 @app.route('/api/orders/customer', methods=['POST'])
 @require_api_key
 def fetch_customer_orders():
@@ -985,7 +1276,8 @@ def fetch_customer_orders():
         fetch_params = {
             'status': 'any',
             'limit': 250,
-            'fields': 'id,name,email,phone,customer,line_items,fulfillment_status,created_at,shipping_address,tags,currency,order_number,total_price'
+            # ADDED: shipping_lines to fields
+            'fields': 'id,name,email,phone,customer,line_items,fulfillment_status,created_at,shipping_address,tags,currency,order_number,total_price,shipping_lines'
         }
         
         if is_email:
@@ -1032,7 +1324,6 @@ def fetch_customer_orders():
     except Exception as e:
         logger.error(f"Error fetching customer orders: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
-
 
 @app.route('/api/orders/<order_name>', methods=['GET'])
 @require_api_key
@@ -1097,6 +1388,91 @@ def get_product_details(product_id):
         logger.error(f"Error fetching product details: {str(e)}")
         return jsonify({'image': None, 'tags': []}), 500
 
+@app.route("/api/bluedart/serviceability", methods=["POST"])
+@require_api_key
+def check_serviceability():
+    """Check if an array of pincodes are serviceable by Blue Dart using Firebase caching"""
+    try:
+        data = request.get_json()
+        pincodes = data.get('pincodes', [])
+        
+        if not pincodes:
+            return jsonify({"success": True, "results": {}})
+
+        # Deduplicate and clean pincodes
+        pincodes = list(set(str(pin).strip() for pin in pincodes if pin))
+        results = {}
+        pincodes_to_fetch = []
+
+        # 1. Check Firebase Cache First
+        if db:
+            try:
+                for pin in pincodes:
+                    doc_ref = db.collection("bluedart_pincodes").document(pin)
+                    doc_snap = doc_ref.get()
+                    if doc_snap.exists:
+                        cached_data = doc_snap.to_dict()
+                        results[pin] = cached_data.get('is_serviceable', False)
+                    else:
+                        pincodes_to_fetch.append(pin)
+            except Exception as e:
+                logger.error(f"Error reading from Firebase cache: {e}")
+                pincodes_to_fetch = pincodes  # Fallback to fetch all if DB read fails
+        else:
+            pincodes_to_fetch = pincodes
+
+        # 2. Fetch missing pincodes from Blue Dart API
+        if pincodes_to_fetch:
+            headers = get_bluedart_auth_headers()
+            SERVICE_URL = os.getenv("BLUEDART_SERVICE_URL")
+            VERSION = os.getenv("BD_VERSION")
+            
+            for pin in pincodes_to_fetch:
+                payload = {
+                    "pinCode": pin,
+                    "profile": {
+                        "Api_type": "S",
+                        "LicenceKey": BlueDartConfig.BD_LICENCE_KEY,
+                        "LoginID": BlueDartConfig.BD_LOGIN_ID,
+                        "Version": VERSION  
+                    }
+                }
+                
+                is_serviceable = False
+                try:
+                    response = requests.post(SERVICE_URL, json=payload, headers=headers, timeout=10)
+                    if response.status_code == 200:
+                        resp_data = response.json()
+                        result = resp_data.get("GetServicesforPincodeResult", {})
+                        
+                        is_error = result.get("IsError", True)
+                        error_message = result.get("ErrorMessage", "")
+                        
+                        is_serviceable = (not is_error) and (error_message.lower() == "valid")
+                    else:
+                        logger.warning(f"Blue Dart API failed for pincode {pin} with status {response.status_code}")
+                except Exception as e:
+                    logger.error(f"Error checking pincode {pin}: {e}")
+                
+                results[pin] = is_serviceable
+                
+                # 3. Save new result to Firebase Cache
+                if db:
+                    try:
+                        db.collection("bluedart_pincodes").document(pin).set({
+                            "pincode": pin,
+                            "is_serviceable": is_serviceable,
+                            "updatedAt": firestore.SERVER_TIMESTAMP
+                        })
+                    except Exception as e:
+                        logger.error(f"Error saving to Firebase cache: {e}")
+
+        return jsonify({"success": True, "results": results})
+
+    except Exception as e:
+        logger.error(f"Serviceability error: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
+    
 @app.route('/api/orders/<int:order_id>/restock', methods=['POST'])
 @require_api_key
 def restock_items(order_id):
@@ -1267,7 +1643,7 @@ def return_rejection():
             'allowResubmit': allow_resubmit,
             'status': 'Closed' if allow_resubmit else 'Denied',
             'notificationType': 'closed' if allow_resubmit else 'denied',
-            'timestamp': datetime.utcnow().isoformat()
+            'timestamp': datetime.now(timezone.utc).isoformat()
         }
         
         success = trigger_webhook(webhook_url, payload, "return-closed" if allow_resubmit else "return-rejected")
@@ -1304,7 +1680,7 @@ def self_ship():
             'refundMethodDetails': get_refund_method_details(return_data.get('requestedMethod')),
             'selfShipDetails': self_ship_details,
             'notificationType': 'self_ship_requested',
-            'timestamp': datetime.utcnow().isoformat()
+            'timestamp': datetime.now(timezone.utc).isoformat()
         }
         
         success = trigger_webhook(N8N_SELF_SHIP_WEBHOOK, payload, "self-ship")
@@ -1344,7 +1720,7 @@ def refund_done():
                 'methodDisplay': format_refund_method(refund_details.get('method'))
             },
             'notificationType': 'refund_done',
-            'timestamp': datetime.utcnow().isoformat()
+            'timestamp': datetime.now(timezone.utc).isoformat()
         }
         
         success = trigger_webhook(N8N_REFUND_DONE_WEBHOOK, payload, "refund-done")
@@ -1381,7 +1757,7 @@ def pickup_created():
             'refundMethodDetails': get_refund_method_details(return_data.get('requestedMethod', '')),
             'pickupDetails': pickup_details,
             'notificationType': 'pickup_created',
-            'timestamp': datetime.utcnow().isoformat()
+            'timestamp': datetime.now(timezone.utc).isoformat()
         }
         
         success = trigger_webhook(N8N_PICKUP_CREATED_WEBHOOK, payload, "pickup-created")
@@ -1418,7 +1794,7 @@ def pickup_cancelled():
             'refundMethodDetails': get_refund_method_details(return_data.get('requestedMethod', '')),
             'cancellationDetails': cancellation_details,
             'notificationType': 'pickup_cancelled',
-            'timestamp': datetime.utcnow().isoformat()
+            'timestamp': datetime.now(timezone.utc).isoformat()
         }
         
         success = trigger_webhook(N8N_PICKUP_CANCELLED_WEBHOOK, payload, "pickup-cancelled")
@@ -1448,7 +1824,12 @@ def refund_gift_card():
         shopify_service = get_shopify_service()
         order_gid = data.get('shopifyOrderId') or f"gid://shopify/Order/{data['orderId']}"
         
-        # Process refund
+        # Merge in orderId/RAN so update_firebase_with_refund can always locate the
+        # return document, even if the caller only nested agentName under metadata.
+        metadata = dict(data.get('metadata', {}))
+        metadata.setdefault('orderId', data['orderId'])
+        metadata.setdefault('RAN', data.get('RAN'))
+        
         result = shopify_service.process_refund(
             order_gid=order_gid,
             amount=data['amount'],
@@ -1456,7 +1837,7 @@ def refund_gift_card():
             line_item_refunds=data['lineItems'],
             note=data.get('note', f"Gift card refund for order {data['orderId']}"),
             notify_customer=data.get('notifyCustomer', True),
-            metadata=data
+            metadata=metadata
         )
         
         if result.success:
@@ -1480,8 +1861,7 @@ def refund_gift_card():
     except Exception as e:
         logger.error(f"Error in gift card refund: {str(e)}")
         return jsonify({'error': str(e)}), 500
-
-
+    
 @app.route('/api/refund/store-credit', methods=['POST'])
 @require_api_key
 def refund_store_credit():
@@ -1499,6 +1879,12 @@ def refund_store_credit():
         shopify_service = get_shopify_service()
         order_gid = data.get('shopifyOrderId') or f"gid://shopify/Order/{data['orderId']}"
         
+        # Merge in orderId/RAN so update_firebase_with_refund can always locate the
+        # return document, even if the caller only nested agentName under metadata.
+        metadata = dict(data.get('metadata', {}))
+        metadata.setdefault('orderId', data['orderId'])
+        metadata.setdefault('RAN', data.get('RAN'))
+        
         result = shopify_service.process_refund(
             order_gid=order_gid,
             amount=data['amount'],
@@ -1506,7 +1892,7 @@ def refund_store_credit():
             line_item_refunds=data['lineItems'],
             note=data.get('note', f"Store credit refund for order {data['orderId']}"),
             notify_customer=data.get('notifyCustomer', True),
-            metadata=data
+            metadata=metadata
         )
         
         if result.success:
@@ -1532,8 +1918,7 @@ def refund_store_credit():
     except Exception as e:
         logger.error(f"Error in store credit refund: {str(e)}")
         return jsonify({'error': str(e)}), 500
-
-
+     
 @app.route('/api/refund/original-payment', methods=['POST'])
 @require_api_key
 def refund_original_payment():
@@ -1551,11 +1936,9 @@ def refund_original_payment():
         shopify_service = get_shopify_service()
         order_gid = data.get('shopifyOrderId') or f"gid://shopify/Order/{data['orderId']}"
         
-        # Step 1: Fetch the order to get the currency and the Parent Transaction
         order_details = shopify_service.get_order_details(order_gid)
         currency_code = order_details.get('totalPriceSet', {}).get('shopMoney', {}).get('currencyCode', 'INR')
         
-        # SAFE TRANSACTION PARSING: Handle both list and connection dicts from Shopify
         raw_transactions = order_details.get('transactions', [])
         if isinstance(raw_transactions, dict):
             transactions_list = [edge.get('node', {}) for edge in raw_transactions.get('edges', [])]
@@ -1570,7 +1953,6 @@ def refund_original_payment():
         if not parent_transaction:
             return jsonify({'error': 'No original successful payment found to refund against on Shopify'}), 400
 
-        # Step 2: Call the updated refund method with the parent transaction details
         refund = shopify_service.refund_to_original_payment(
             order_gid=order_gid,
             refund_amount=data['amount'],
@@ -1581,11 +1963,9 @@ def refund_original_payment():
             notify=data.get('notifyCustomer', True)
         )
         
-        # SAFE REFUND PARSING: Prevent IndexError if Shopify doesn't return edges
         refund_edges = refund.get('transactions', {}).get('edges', [])
         first_transaction = refund_edges[0].get('node', {}) if refund_edges else {}
         
-        # Step 3: Map data to RefundResult so Firebase updates correctly
         refund_result = RefundResult(
             success=True,
             refund_method=RefundMethod.ORIGINAL_PAYMENT,
@@ -1598,7 +1978,12 @@ def refund_original_payment():
             order_name=order_details.get('name')
         )
         
-        firebase_updated = shopify_service.update_firebase_with_refund(refund_result, data)
+        # Merge in orderId/RAN so update_firebase_with_refund can always locate the
+        # return document, even if the caller only nested agentName under metadata.
+        metadata = dict(data.get('metadata', {}))
+        metadata.setdefault('orderId', data['orderId'])
+        metadata.setdefault('RAN', data.get('RAN'))
+        firebase_updated = shopify_service.update_firebase_with_refund(refund_result, metadata)
         
         return jsonify({
             'success': True,
@@ -1616,11 +2001,11 @@ def refund_original_payment():
     except Exception as e:
         logger.error(f"Error in original payment refund: {str(e)}")
         return jsonify({'error': str(e)}), 500
-
+    
 @app.route('/api/refund/manual', methods=['POST'])
 @require_api_key
 def refund_manual():
-    """Mark refund as manually processed with agent attribution"""
+    """Mark refund as manually processed with proper agent attribution"""
     try:
         data = request.get_json()
         if not data:
@@ -1631,8 +2016,10 @@ def refund_manual():
             if field not in data:
                 return jsonify({'error': f'Missing required field: {field}'}), 400
         
-        # Extract agent name from the top level of the request[cite: 10]
-        agent_name = data.get('agentName', 'System')
+        # 👇 FIX: Extract agentName correctly from the nested metadata object 👇
+        metadata = data.get('metadata', {})
+        agent_name = metadata.get('agentName', 'System')
+        
         manual_refund_id = f"manual_{data['orderId']}_{int(datetime.now().timestamp())}"
         
         firebase_updated = False
@@ -1652,20 +2039,23 @@ def refund_manual():
                         'refundDetails': {
                             'method': 'manual',
                             'finalAmount': float(data['amount']),
-                            'note': data.get('note', 'Manual refund processed')
+                            'note': data.get('note', 'Manual refund processed'),
+                            'baseAmount': metadata.get('baseAmount', 0),
+                            'shippingRefundAddition': metadata.get('shippingRefundAddition', 0),
+                            'deductions': metadata.get('deductions', {}),
+                            'quantityMultiplied': metadata.get('quantityMultiplied', {})
                         }
                     }
                     
                     return_ref.update(update_data)
                     
-                    # Log activity with the actual agent name[cite: 10]
                     activities_ref = db.collection('returns').document(data['orderId']).collection('activities')
                     activities_ref.add({
                         'type': 'success',
                         'title': 'Refund Issued',
                         'description': f"Refund of ₹{float(data['amount']):.2f} marked as manually processed",
                         'timestamp': firestore.SERVER_TIMESTAMP,
-                        'user': agent_name,  # Attributed to logged-in agent[cite: 10]
+                        'user': agent_name,  # ✅ Now correctly attributed
                         'metadata': {
                             'refundMethod': 'manual',
                             'amount': float(data['amount']),
@@ -1688,7 +2078,7 @@ def refund_manual():
     except Exception as e:
         logger.error(f"Error in manual refund: {str(e)}")
         return jsonify({'error': str(e)}), 500
-
+    
 @app.route('/api/products/<int:product_id>/variants', methods=['GET'])
 @require_api_key
 def get_product_variants(product_id):
@@ -1783,7 +2173,52 @@ def get_product_variants(product_id):
     except Exception as e:
         logger.error(f"Error fetching product variants for {product_id}: {str(e)}")
         return jsonify({'error': str(e)}), 500
- 
+
+@app.route('/api/orders/<int:order_id>/tags', methods=['POST'])
+@require_api_key
+def add_order_tag(order_id):
+    """
+    Safely appends a tag to a Shopify order without overwriting existing tags.
+    """
+    try:
+        data = request.get_json()
+        new_tag = data.get('tag')
+        
+        if not new_tag:
+            return jsonify({'error': 'Tag is required'}), 400
+
+        # 1. Fetch the existing order to get the current tags
+        response = shopify_session.get(f"{SHOPIFY_BASE_URL}/orders/{order_id}.json", timeout=10)
+        
+        if response.status_code != 200:
+            return jsonify({'error': 'Failed to fetch order from Shopify'}), 500
+        
+        order_data = response.json().get('order', {})
+        current_tags = order_data.get('tags', '')
+        
+        # 2. Convert comma-separated string to a list and clean whitespace
+        tags_list = [t.strip() for t in current_tags.split(',')] if current_tags else []
+        
+        # 3. Only add the tag if it doesn't already exist
+        if new_tag not in tags_list:
+            tags_list.append(new_tag)
+            updated_tags_string = ", ".join(tags_list)
+            
+            # 4. Push the combined tags back to Shopify
+            update_res = shopify_session.put(
+                f"{SHOPIFY_BASE_URL}/orders/{order_id}.json",
+                json={"order": {"id": order_id, "tags": updated_tags_string}},
+                timeout=10
+            )
+            
+            if update_res.status_code == 200:
+                return jsonify({'success': True, 'tags': updated_tags_string})
+            return jsonify({'error': 'Failed to update Shopify tags'}), 500
+            
+        return jsonify({'success': True, 'message': 'Tag already exists'})
+    except Exception as e:
+        logger.error(f"Error updating tags: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/products/by-sku/<path:sku>/variants', methods=['GET', 'OPTIONS'])
 @require_api_key
@@ -1926,81 +2361,104 @@ def get_product_variants_by_sku(sku):
 # CUSTOMER BALANCE ENDPOINTS - Add these to your app.py
 # ==========================================================
 
-@app.route('/api/customer/balances', methods=['POST', 'OPTIONS'])
+@app.route('/api/customer/balances', methods=['POST'])
 @require_api_key
 def get_customer_balances():
-    """Get both gift cards and store credit for a customer by email or phone"""
-    # Handle preflight CORS request
-    if request.method == 'OPTIONS':
-        return '', 200
-    
+    """Ultra-lean, memory-efficient fetch for balances using HTTP Keep-Alive"""
     try:
         data = request.get_json()
-        if not data:
-            logger.error("No JSON data received in request")
-            return jsonify({'error': 'No data provided'}), 400
-            
-        identifier = data.get('identifier')
-        identifier_type = data.get('identifierType', 'email')
-                
-        if not identifier:
+        if not data or not data.get('identifier'):
             return jsonify({'error': 'Missing identifier'}), 400
-        
-        identifier = identifier.strip()
-        
-        # Validate identifier format
-        if identifier_type == 'email':
-            if '@' not in identifier or '.' not in identifier:
-                return jsonify({'error': 'Invalid email format'}), 400
-        elif identifier_type == 'phone':
-            # Clean phone number and validate
-            clean_phone = re.sub(r'\D', '', identifier)
-            if len(clean_phone) < 10:
-                return jsonify({'error': 'Invalid phone number (minimum 10 digits required)'}), 400
-        
-        # Step 1: Find the customer
-        customer = find_customer_by_identifier(identifier, identifier_type)
-        
-        if not customer:
-            logger.warning(f"No customer found for {identifier_type}: {identifier}")
-            return jsonify({
-                'customer_found': False,
-                'email': identifier if identifier_type == 'email' else '',
-                'store_credit_accounts': [],
-                'gift_cards': []
-            }), 200
-                
-        # Step 2: Get store credit accounts (with error handling)
-        store_credit_accounts = []
-        try:
-            store_credit_accounts = get_customer_store_credit_accounts(customer)
-        except Exception as e:
-            logger.error(f"Error fetching store credit: {str(e)}", exc_info=True)
-            # Continue without store credit data
-        
-        # Step 3: Get gift cards (with error handling)
-        gift_cards = []
-        try:
-            gift_cards = get_customer_gift_cards(customer)
-        except Exception as e:
-            logger.error(f"Error fetching gift cards: {str(e)}", exc_info=True)
-            # Continue without gift card data
-        
-        response_data = {
-            'customer_found': True,
-            'email': customer.get('email', ''),
-            'customer_graphql_id': customer.get('id'),
-            'customer_legacy_id': customer.get('legacyResourceId'),
-            'store_credit_accounts': store_credit_accounts,
-            'gift_cards': gift_cards
-        }
-        
-        return jsonify(response_data), 200
-        
-    except Exception as e:
-        logger.error(f"Error fetching customer balances: {str(e)}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
 
+        identifier = data.get('identifier').strip()
+        identifier_type = data.get('identifierType', 'email')
+
+        # 1. TCP Connection Pooling (Saves ~500ms-1s by skipping the second SSL handshake)
+        session = requests.Session()
+        session.headers.update({
+            "Content-Type": "application/json",
+            "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
+        })
+        graphql_url = f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+
+        # 2. Optimized Query 1: Get Customer AND Store Credit in one tiny payload
+        customer_node = None
+        if identifier_type == 'email':
+            q1 = """
+            query($email: String!) {
+              customer: customerByIdentifier(identifier: {emailAddress: $email}) {
+                id legacyResourceId email
+                storeCreditAccounts(first: 5) { nodes { id balance { amount currencyCode } } }
+              }
+            }
+            """
+            res = session.post(graphql_url, json={"query": q1, "variables": {"email": identifier}}, timeout=10)
+            customer_node = res.json().get('data', {}).get('customer')
+        else:
+            clean_phone = re.sub(r'\D', '', identifier)[-10:]
+            q1 = """
+            query($phone: String!) {
+              customers(first: 1, query: $phone) {
+                nodes {
+                  id legacyResourceId email
+                  storeCreditAccounts(first: 5) { nodes { id balance { amount currencyCode } } }
+                }
+              }
+            }
+            """
+            res = session.post(graphql_url, json={"query": q1, "variables": {"phone": f"phone:*{clean_phone}*"}}, timeout=10)
+            nodes = res.json().get('data', {}).get('customers', {}).get('nodes', [])
+            if nodes: 
+                customer_node = nodes[0]
+
+        # Exit early if no customer exists
+        if not customer_node:
+            return jsonify({'customer_found': False, 'store_credit_accounts': [], 'gift_cards': []}), 200
+
+        # 3. Extract Store Credit cleanly
+        store_credits = []
+        for acc in customer_node.get('storeCreditAccounts', {}).get('nodes', []):
+            store_credits.append({
+                'id': acc.get('id'),
+                'balance_amount': float(acc.get('balance', {}).get('amount', 0)),
+                'balance_currency': acc.get('balance', {}).get('currencyCode', 'INR')
+            })
+
+        # 4. Optimized Query 2: Get Gift Cards using the exact same open connection
+        legacy_id = customer_node.get('legacyResourceId')
+        gift_cards = []
+        
+        if legacy_id:
+            q2 = """
+            query($query: String!) {
+              giftCards(first: 15, query: $query) {
+                nodes { id maskedCode balance { amount currencyCode } }
+              }
+            }
+            """
+            res2 = session.post(graphql_url, json={"query": q2, "variables": {"query": f"customer_id:{legacy_id} status:enabled"}}, timeout=10)
+            
+            for gc in res2.json().get('data', {}).get('giftCards', {}).get('nodes', []):
+                gift_cards.append({
+                    'id': gc.get('id'),
+                    'code': gc.get('maskedCode'),
+                    'balance_amount': float(gc.get('balance', {}).get('amount', 0)),
+                    'balance_currency': gc.get('balance', {}).get('currencyCode', 'INR')
+                })
+
+        # 5. Return payload
+        return jsonify({
+            'customer_found': True,
+            'email': customer_node.get('email', ''),
+            'customer_graphql_id': customer_node.get('id'),
+            'customer_legacy_id': legacy_id,
+            'store_credit_accounts': store_credits,
+            'gift_cards': gift_cards
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Balances error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Failed to process balance request'}), 500
 
 def find_customer_by_identifier(identifier: str, identifier_type: str) -> Optional[Dict]:
     """Find customer by email or phone using Shopify GraphQL API"""
@@ -2184,7 +2642,7 @@ def return_received():
             **data,
             'refundMethodDisplay': format_refund_method(data.get('requestedMethod')),
             'notificationType': 'return_received',
-            'timestamp': datetime.utcnow().isoformat()
+            'timestamp': datetime.now(timezone.utc).isoformat()
         }
         
         success = trigger_webhook(N8N_RETURN_RECEIVED_WEBHOOK, payload, "return-received")
@@ -2203,7 +2661,7 @@ def item_rejection():
         payload = {
             **data,
             'notificationType': 'item_rejected',
-            'timestamp': datetime.utcnow().isoformat()
+            'timestamp': datetime.now(timezone.utc).isoformat()
         }
         
         success = trigger_webhook(N8N_ITEM_REJECTION_WEBHOOK, payload, "item-rejected")
@@ -2387,7 +2845,7 @@ def cancel_waybill():
                 if docs:
                     doc_ref = docs[0].reference
                     doc_ref.update({
-                        "status": "Cancelled",
+                        "status": "Open", # <--- FIX: Revert to Open instead of Cancelled
                         "shipmentStatus": "Pickup Cancelled",
                         "updatedAt": firestore.SERVER_TIMESTAMP,
                         "cancellationDetails": {
@@ -2421,48 +2879,219 @@ def cancel_waybill():
         logger.error(f"Error cancelling waybill: {str(e)}")
         return jsonify({"success": False, "error": str(e)}), 500
 
-
 @app.route("/api/bluedart/tracking", methods=["GET"])
 @require_api_key
 def track_shipment():
-    """Track shipment by AWB number"""
+    """Track shipment by AWB number using Blue Dart Routing Servlet"""
     try:
         awb_numbers = request.args.get('awb', '')
         if not awb_numbers:
             return jsonify({"error": "AWB number required", "success": False}), 400
         
+        # Using the reliable RoutingServlet parameters
         params = {
             "handler": "tnt",
-            "loginid": BlueDartConfig.BD_LOGIN_ID,
-            "lickey": BlueDartConfig.BD_LICENCE_KEY,
-            "numbers": awb_numbers,
-            "format": "json",
-            "scan": "1",
             "action": "custawbquery",
-            "verno": "1",
+            "loginid": BlueDartConfig.BD_LOGIN_ID,
+            "lickey": BlueDartConfig.BD_TRACKING_LICENSE_KEY, # Using tracking specific key
+            "numbers": awb_numbers,
+            "format": "json", # Requesting JSON directly so frontend parsing works
+            "verno": "1.3",
+            "scan": "1",
             "awb": "awb"
         }
         
-        headers = get_bluedart_auth_headers()
+        # Notice we removed the JWT headers, the RoutingServlet doesn't need them
         response = requests.get(
             BlueDartConfig.BLUEDART_TRACKING_URL,
             params=params,
-            headers=headers,
             timeout=BlueDartConfig.REQUEST_TIMEOUT
         )
         
         tracking_data = response.json() if response.status_code == 200 else None
+        
+        if tracking_data:
+            shipment_data = tracking_data.get('ShipmentData', {})
+            
+            if isinstance(shipment_data, dict) and 'Error' in shipment_data:
+                error_msg = shipment_data['Error']
+                logger.error(f"Blue Dart API Error for AWB {awb_numbers}: {error_msg}")
+                return jsonify({"success": False, "error": f"Blue Dart: {error_msg}"}), 400
+            
+            # Normal logging parsing...
+            if isinstance(shipment_data, list):
+                shipment = shipment_data[0].get('Shipment', shipment_data[0])
+            elif isinstance(shipment_data, dict) and 'Shipment' in shipment_data:
+                s = shipment_data['Shipment']
+                shipment = s[0] if isinstance(s, list) else s
+            else:
+                shipment = shipment_data
+            
+            if isinstance(shipment, dict):
+                status = shipment.get('Status', 'UNKNOWN')
+                status_type = shipment.get('StatusType', 'UNKNOWN')
+                logger.info(f"🚚 AWB {awb_numbers} Status: {status} (Type: {status_type})")
         
         return jsonify({
             "success": response.status_code == 200,
             "tracking": tracking_data,
             "error": None if response.status_code == 200 else "Tracking failed"
         })
+        
     except Exception as e:
         logger.error(f"Error tracking shipment: {str(e)}")
         return jsonify({"success": False, "error": str(e)}), 500
+    
+@app.route('/api/auth/login', methods=['POST'])
+@require_api_key
+def login_agent():
+    """Authenticates the agent or triggers first-time setup"""
+    try:
+        data = request.get_json()
+        email = data.get('email', '').strip()
+        password_or_phone = data.get('password', '').strip()
+
+        if not db:
+            return jsonify({"error": "Database not connected"}), 500
+
+        docs = list(db.collection("agents").where(filter=FieldFilter("email", "==", email)).limit(1).stream())
+        if not docs:
+            return jsonify({"error": "Invalid email or credentials"}), 401
+        
+        agent_doc = docs[0]
+        agent_data = agent_doc.to_dict()
+
+        if agent_data.get("hasSetPassword"):
+            # Note: In a production environment, you should use hashed passwords (e.g., bcrypt)
+            if agent_data.get("password") == password_or_phone:
+                return jsonify({"success": True, "needsSetup": False, "agent": {
+                    "email": agent_data.get("email"),
+                    "name": agent_data.get("name"),
+                    "role": "agent",
+                    "profilePic": agent_data.get("profilePic", "")
+                }})
+            return jsonify({"error": "Invalid email or password"}), 401
+        else:
+            # First time login using phone number
+            if agent_data.get("phone") == password_or_phone:
+                return jsonify({"success": True, "needsSetup": True})
+            return jsonify({"error": "Invalid email or phone number"}), 401
+
+    except Exception as e:
+        logger.error(f"Login error: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
 
 
+@app.route('/api/auth/setup-password', methods=['POST'])
+@require_api_key
+def setup_password():
+    """Saves the new password for the agent"""
+    try:
+        data = request.get_json()
+        email = data.get('email', '').strip()
+        new_password = data.get('password', '')
+
+        docs = list(db.collection("agents").where(filter=FieldFilter("email", "==", email)).limit(1).stream())
+        if not docs:
+            return jsonify({"error": "Agent not found"}), 404
+        
+        doc_ref = docs[0].reference
+        doc_ref.update({
+            "password": new_password, # Should be hashed in production
+            "hasSetPassword": True
+        })
+
+        agent_data = docs[0].to_dict()
+        return jsonify({"success": True, "agent": {
+            "email": agent_data.get("email"),
+            "name": agent_data.get("name"),
+            "role": "agent",
+            "profilePic": agent_data.get("profilePic", "")
+        }})
+
+    except Exception as e:
+        logger.error(f"Setup password error: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route('/api/auth/send-otp', methods=['POST'])
+@require_api_key
+def send_otp():
+    """Generates an OTP securely on the backend and triggers n8n"""
+    try:
+        data = request.get_json()
+        email = data.get('email', '').strip()
+
+        # FIX: Updated the where() syntax to use standard positional arguments
+        docs = list(db.collection("agents").where(filter=FieldFilter("email", "==", email)).limit(1).stream())
+        
+        if not docs:
+            return jsonify({"error": "Email not found"}), 404
+        
+        # Generate 6-digit OTP
+        otp = str(random.randint(100000, 999999))
+        expiry = datetime.now() + timedelta(minutes=10) # OTP valid for 10 mins
+        
+        doc_ref = docs[0].reference
+        doc_ref.update({
+            "resetOtp": otp,
+            "otpExpiry": expiry
+        })
+
+        # Trigger n8n Webhook
+        if N8N_OTP_WEBHOOK:
+            requests.post(N8N_OTP_WEBHOOK, json={"email": email, "otp": otp}, timeout=10)
+
+        return jsonify({"success": True, "message": "OTP sent successfully"})
+
+    except Exception as e:
+        logger.error(f"Send OTP error: {str(e)}")
+        return jsonify({"error": "Failed to generate OTP"}), 500
+
+@app.route('/api/auth/verify-otp', methods=['POST'])
+@require_api_key
+def verify_otp():
+    """Validates the OTP entered by the user against the database"""
+    try:
+        data = request.get_json()
+        email = data.get('email', '').strip()
+        entered_otp = data.get('otp', '').strip()
+
+        docs = list(db.collection("agents").where(filter=FieldFilter("email", "==", email)).limit(1).stream())
+        if not docs:
+            return jsonify({"error": "Agent not found"}), 404
+        
+        agent_data = docs[0].to_dict()
+        stored_otp = agent_data.get("resetOtp")
+        expiry = agent_data.get("otpExpiry")
+
+        if not stored_otp or not expiry:
+            return jsonify({"error": "No OTP requested"}), 400
+
+        # Handle Firestore datetime format
+        if hasattr(expiry, 'timestamp'):
+            expiry_dt = datetime.fromtimestamp(expiry.timestamp())
+        else:
+            expiry_dt = expiry 
+
+        if datetime.now() > expiry_dt:
+            return jsonify({"error": "OTP has expired"}), 400
+
+        if stored_otp != entered_otp:
+            return jsonify({"error": "Invalid OTP"}), 400
+
+        # OTP is valid, clear it
+        docs[0].reference.update({
+            "resetOtp": None,
+            "otpExpiry": None
+        })
+
+        return jsonify({"success": True})
+
+    except Exception as e:
+        logger.error(f"Verify OTP error: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
+    
 # ==========================================================
 # HEALTH CHECK
 # ==========================================================
@@ -2476,7 +3105,7 @@ def health_check():
         'version': '1.0.0',
         'firebase': firebase_status,
         'shopify': 'configured' if SHOPIFY_ACCESS_TOKEN else 'missing',
-        'timestamp': datetime.utcnow().isoformat()
+        'timestamp': datetime.now(timezone.utc).isoformat()
     }), 200
 
 
